@@ -28,12 +28,17 @@ ORANGE = "#e67e22"
 GREY   = "#888888"
 
 COLORS = [
-    "#4e79a7","#f28e2b","#e15759","#76b7b2","#59a14f",
-    "#edc948","#b07aa1","#ff9da7","#9c755f","#bab0ac",
-    "#00b4d8","#80b918","#f4a261","#e76f51","#264653",
-    "#2a9d8f","#e9c46a","#6d6875","#b5838d","#e2c2c6",
-    "#457b9d","#a8dadc","#f1faee","#e63946",
+    "#2166ac","#d6604d","#4dac26","#8073ac","#f4a582",
+    "#1a9850","#e08214","#74add1","#c51b7d","#4d9221",
+    "#762a83","#de77ae","#7fbc41","#e7298a","#66bd63",
+    "#d73027","#1b7837","#9970ab","#fdae61","#a6d854",
+    "#f46d43","#3288bd","#abdda4","#fee08b",
 ]
+
+def _rgba(hex_color: str, alpha: float = 0.75) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
 
 # ---------------------------------------------------------------- DB-Hilfsfunktionen
 def get_db() -> sqlite3.Connection:
@@ -166,11 +171,12 @@ def build_stack_chart(payload: dict, visible: set | None = None) -> go.Figure:
     fig = go.Figure()
     for i, (label, vals) in enumerate(zip(labels, series)):
         show = visible is None or label in visible
+        color = COLORS[i % len(COLORS)]
         fig.add_trace(go.Scatter(
             x=dates, y=vals, name=label,
             stackgroup="one",
-            line=dict(width=0.5),
-            fillcolor=COLORS[i % len(COLORS)] + "cc",
+            line=dict(color=color, width=0.8),
+            fillcolor=_rgba(color, 0.7),
             visible=True if show else "legendonly",
             hovertemplate="%{y:,.2f} €<extra>" + label + "</extra>",
         ))
@@ -198,7 +204,7 @@ def build_pie_chart(payload: dict) -> go.Figure:
         sort=False,
         texttemplate="%{label}<br>%{percent:.1%}",
         hovertemplate="%{label}: %{value:,.2f} €  (%{percent:.1%})<extra></extra>",
-        marker=dict(colors=COLORS[:len(labels)]),
+        marker=dict(colors=[COLORS[i % len(COLORS)] for i in range(len(labels))]),
     ))
     fig.update_layout(
         height=380, margin=dict(l=0, r=0, t=10, b=0),
