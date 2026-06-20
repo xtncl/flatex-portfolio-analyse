@@ -550,6 +550,18 @@ def main(args=None):
                     factor *= ratio
             t["adj_qty"] = t["qty"] * factor
 
+    # Unvollständige Historie erkennen: mehr verkauft als gekauft -> Kauf liegt vor
+    # dem Export. Einstand unbekannt -> Position aus allen Zahlen ausschliessen.
+    incomplete = []
+    incomplete_isins = set()
+    for gid, ins in instruments.items():
+        ba = sum(t["adj_qty"] for t in ins["txns"] if t["adj_qty"] > 0)
+        sa = sum(-t["adj_qty"] for t in ins["txns"] if t["adj_qty"] < 0)
+        ins["incomplete"] = sa > ba + 1e-6
+        if ins["incomplete"]:
+            incomplete.append(ins["name"])
+            incomplete_isins.update(ins["isins"])
+
     # Verrechnungskonto (optional): echte Bardividenden je ISIN + Ein-/Auszahlungen
     cash = load_cash_account(cash_path) if cash_path else None
     cash_div = cash["div"] if cash else None
@@ -562,9 +574,13 @@ def main(args=None):
     val_ok = val_bad = 0
     from collections import deque
     for key, ins in sorted(instruments.items(), key=lambda x: x[1]["name"]):
+        if ins["incomplete"]:
+            continue                       # Einstand unbekannt -> nicht bewertbar
         tx = sorted(ins["txns"], key=lambda t: t["date"])
         buys  = sum(t["betrag"] for t in tx if t["betrag"] > 0)
         sells = sum(-t["betrag"] for t in tx if t["betrag"] < 0)
+
+        buy_adj = sum(t["adj_qty"] for t in tx if t["adj_qty"] > 0)     # gekaufte Stk.
 
         # FIFO: realisierte G/V + verbleibende Lots (in heutiger Split-Basis)
         lots = deque()        # [adj_qty_rest, einstand_pro_adj_stk]
@@ -572,29 +588,26 @@ def main(args=None):
         for t in tx:
             if t["adj_qty"] > 0:                       # Kauf
                 lots.append([t["adj_qty"], t["betrag"] / t["adj_qty"]])
-            else:                                      # Verkauf
-                sell_adj = -t["adj_qty"]
-                price_per = (-t["betrag"]) / sell_adj
-                while sell_adj > 1e-9 and lots:
+            elif t["adj_qty"] < 0:                     # Verkauf
+                sell_rest = -t["adj_qty"]
+                price_per = (-t["betrag"]) / sell_rest
+                while sell_rest > 1e-9 and lots:
                     lot = lots[0]
-                    take = min(sell_adj, lot[0])
+                    take = min(sell_rest, lot[0])
                     realized += take * (price_per - lot[1])
-                    lot[0] -= take; sell_adj -= take
+                    lot[0] -= take; sell_rest -= take
                     if lot[0] <= 1e-9:
                         lots.popleft()
         remaining = sum(l[0] for l in lots)            # heutige Stueck
         cost_rest = sum(l[0] * l[1] for l in lots)     # Einstand offener Stueck
-        avg_cost  = (cost_rest / remaining) if remaining > 1e-9 else \
-                    (buys / sum(t["adj_qty"] for t in tx if t["adj_qty"] > 0) or 1)
+        # Einstandspreis pro adj. Stück (0, falls keine Käufe im Export -> kein Crash)
+        cost_price = (buys / buy_adj) if buy_adj > 1e-9 else 0.0
+        avg_cost   = (cost_rest / remaining) if remaining > 1e-9 else cost_price
 
         # tägliche Stückzahl (adjustiert) als Stufenfunktion
         hold = pd.Series(0.0, index=bdays)
         for t in tx:
             hold.loc[pd.Timestamp(t["date"]):] += t["adj_qty"]
-
-        # Einstandspreis pro adj. Stück (für "zu Einstand"-Bewertung)
-        buy_adj_total = sum(t["adj_qty"] for t in tx if t["adj_qty"] > 0) or 1.0
-        cost_price = buys / buy_adj_total
 
         # Sicherheits-Check: weichen Flatex- und Yahoo-Splits ab -> Kurse unzuverlässig
         if ins["special"] is None and split_mismatch(ins):
@@ -676,7 +689,8 @@ def main(args=None):
                          special=ins["special"] or ""))
 
     # nur echte Geldfluesse (Kauf/Verkauf) zaehlen fuer Cashflow-Kennzahlen
-    cash_txns = [t for t in txns if t["kind"] in ("buy", "sell")]
+    cash_txns = [t for t in txns if t["kind"] in ("buy", "sell")
+                 and t["isin"] not in incomplete_isins]
 
     # ---- eingezahltes Geld (Cash-Basislinie = "nicht investiert")
     flow = pd.Series(0.0, index=bdays)
@@ -791,6 +805,11 @@ def main(args=None):
     render_table(df, eur)
     if missing:
         print("\n  Hinweis - ohne Marktdaten (zu Einstand bewertet): " + ", ".join(missing))
+    if incomplete:
+        print("\n  ⚠ Mehr verkauft als gekauft (Kauf liegt vermutlich VOR dem Export):")
+        print("    " + ", ".join(incomplete))
+        print("    -> Für korrekte Zahlen den vollständigen Flatex-Export ab "
+              "Depoteröffnung verwenden.")
     if (val_ok + val_bad):
         print(f"\n  Validierung Kaufkurse vs. Marktdaten: {val_ok}/{val_ok+val_bad} "
               f"Käufe stimmen (±30%) überein.")
@@ -833,6 +852,7 @@ def main(args=None):
                                        "wert_heute": float(r["wert_heute_verkauft"])}
     payload = {
         "today": TODAY.strftime("%d.%m.%Y"),
+        "incomplete": incomplete,
         "stats": {"total_pl": total_pl, "cur_value": cur_value, "invested": invested,
                   "buys": total_buys, "sells": total_sells, "realized": realized_pl,
                   "unreal": unreal_pl, "dividends": float(df["dividends"].sum()),
@@ -1046,6 +1066,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
   .divbanner{margin:14px 0 2px;background:#eef7f0;border:1px solid #cfe8d6;border-radius:12px;
              padding:13px 18px;font-size:14.5px;display:flex;flex-wrap:wrap;gap:6px 18px;align-items:baseline}
   .divbanner b{font-size:16px}
+  .warnbanner{margin:14px 0 2px;background:#fdeeee;border:1px solid #f3c9c9;border-radius:12px;
+              padding:13px 18px;font-size:14px;color:#8a2a22}
   .panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 8px 4px;
          box-shadow:0 1px 2px rgba(0,0,0,.03)}
   .callouts{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:10px}
@@ -1078,6 +1100,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <div class="wrap">
   <h1>Mein Aktien-Portfolio</h1>
   <div class="sub" id="sub"></div>
+  <div id="warnbanner"></div>
   <div class="cards" id="cards"></div>
   <div class="divbanner" id="divbanner"></div>
   <div id="cashflow"></div>
@@ -1124,6 +1147,12 @@ const cls = x => x>=0?'pos':'neg';
 
 /* ---- Stat-Karten ---- */
 document.getElementById('sub').textContent = 'Stand '+D.today+' · '+D.positions.length+' Positionen';
+if(D.incomplete && D.incomplete.length){
+  document.getElementById('warnbanner').innerHTML =
+    '⚠ <b>Unvollständige Historie:</b> bei folgenden Titeln wurde mehr verkauft als gekauft – '+
+    'der Kauf liegt vermutlich vor dem Export. Sie sind hier ausgeschlossen (Einstand unbekannt): <b>'+
+    D.incomplete.join(', ')+'</b>. Für vollständige Zahlen den Flatex-Export ab Depoteröffnung verwenden.';
+}
 const s = D.stats;
 const benchDiff = s.bench!=null ? (s.bench - s.cur_value) : null;
 const cards = [
