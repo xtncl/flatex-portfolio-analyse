@@ -11,6 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY portfolio_analyse.py portfolio_app.py ./
+COPY .streamlit/ .streamlit/
 
 # Persistente Daten (SQLite + Kurs-Cache) als Volume einbinden
 VOLUME ["/app/data"]
