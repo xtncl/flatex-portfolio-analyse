@@ -1,0 +1,25 @@
+# Private Flatex-Exporte UND generierte Tabellen (positionen.csv)
+*.csv
+
+# Generierte Reports / Grafiken
+portfolio_report.html
+*.png
+
+# Cache (Kurse, Splits, Devisen, ISIN->Ticker-Auflösung)
+cache/
+tickers.json
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# macOS / Editor
+.DS_Store
+.vscode/
+.idea/
