@@ -40,11 +40,8 @@ OUT_HTML = "portfolio_report.html"
 BENCH_TICKER = "IWRD.L"          # MSCI World ETF fuer Vergleichslinie
 SPLIT_TOL = 0.05                 # Toleranz Flatex- vs Yahoo-Splitfaktor
 
-# Positionen ohne verlaesslichen Marktkurs -> Sonderbehandlung (nicht autom. erkennbar)
-SPECIAL = {
-    "US46186M5067": "zero",   # InVivo Therapeutics: delisted/wertlos -> Wert 0
-    "US84615Q1031": "cost",   # SpaceX: privat, kein Boersenkurs -> zu Einstand bewertet
-}
+# Sonderbewertung einzelner Titel (z.B. delistet -> Wert 0, kein Kurs -> zu Einstand)
+# kommt aus einer optionalen, NICHT versionierten overrides.json (siehe load_overrides).
 
 # Waehrung -> benoetigtes Yahoo-FX-Paar (EUR pro 1 Einheit Fremdwaehrung)
 FX_PAIRS = {"USD":"EURUSD=X","GBP":"EURGBP=X","HKD":"EURHKD=X",
@@ -84,6 +81,20 @@ def xirr(cashflows):
 
 
 import urllib.request
+
+def load_overrides(path=None):
+    """Optionale, NICHT versionierte Sonderbewertung je ISIN (overrides.json):
+        {"<ISIN>": "zero"}  -> Marktwert 0   (z.B. delistet/wertlos)
+        {"<ISIN>": "cost"}  -> zu Einstand   (z.B. kein verlaesslicher Boersenkurs)
+    Haelt persoenliche Bestandsdetails aus dem (oeffentlichen) Repo heraus."""
+    fp = path or "overrides.json"
+    if os.path.exists(fp):
+        try:
+            data = json.load(open(fp, encoding="utf-8"))
+            return {k: v for k, v in data.items() if v in ("zero", "cost")}
+        except Exception as e:
+            sys.stderr.write(f"   {fp} ignoriert ({e})\n")
+    return {}
 
 def _yahoo_search_isin(isin):
     """ISIN -> Yahoo-Ticker ueber die oeffentliche Such-API (kein LLM, kein Key)."""
@@ -425,6 +436,9 @@ def parse_args(argv=None):
                    help="Stichtag der Bewertung (Standard: heute).")
     p.add_argument("--no-konto", "--no-cash", dest="no_cash", action="store_true",
                    help="Kontoexport ignorieren; Dividenden werden dann geschätzt.")
+    p.add_argument("--overrides", metavar="JSON",
+                   help='Sonderbewertung je ISIN ({"ISIN":"zero|cost"}). '
+                        "Standard: overrides.json im aktuellen Ordner, falls vorhanden.")
     a = p.parse_args(argv)
     a.transactions = a.transactions or a.transactions_opt
     return a
@@ -444,6 +458,8 @@ def main(args=None):
     else:
         cp = find_cash_csv()
         cash_path = os.path.abspath(cp) if cp else None
+    ovr_path = os.path.abspath(args.overrides) if args.overrides else (
+        os.path.abspath("overrides.json") if os.path.exists("overrides.json") else None)
     for label, pth in (("Wertpapier-Export", tx_path), ("Konto-Export", cash_path)):
         if pth and not os.path.exists(pth):
             sys.exit(f"Datei nicht gefunden: {pth}")
@@ -454,6 +470,7 @@ def main(args=None):
     print(f"  Wertpapier-Export : {tx_path}")
     print(f"  Konto-Export      : {cash_path or '(keiner – Dividenden werden geschätzt)'}")
 
+    special_map = load_overrides(ovr_path)
     txns = load_transactions(tx_path)
     isin2ticker = resolve_tickers({t["isin"] for t in txns} |
                                   {t["ref_isin"] for t in txns if t["ref_isin"]})
@@ -466,7 +483,7 @@ def main(args=None):
         gtx = sorted((t for t in txns if isin2grp[t["isin"]] == gid),
                      key=lambda t: t["date"])
         canon = gtx[-1]["isin"]                       # aktuelle ISIN -> aktueller Ticker
-        special = next((SPECIAL[i] for i in isins if i in SPECIAL), None)
+        special = next((special_map[i] for i in isins if i in special_map), None)
         name = next((t["name"] for t in reversed(gtx) if t["kind"] != "corp"),
                     gtx[-1]["name"])
         instruments[gid] = {"name": name, "ticker": isin2ticker.get(canon),
@@ -1180,10 +1197,10 @@ document.querySelectorAll('#tbl th').forEach(th=>th.addEventListener('click',()=
 draw();
 
 document.getElementById('foot').innerHTML =
-  'Realisierte G/V exakt aus Cashflows · Marktwerte über Yahoo-Kurse, in EUR umgerechnet · '+
-  'Aktiensplits berücksichtigt (NVIDIA, Tesla, BYD u.&nbsp;a.) · SpaceX (privat) zu Einstand, InVivo (delistet) = 0. '+
-  'Dividenden = Brutto-Schätzung aus der Ausschüttungshistorie × gehaltene Stück je Ex-Tag (vor Quellensteuer/KESt; '+
-  'BYD &amp; SpaceX ausgenommen). Für exakte Netto-Beträge einen Flatex-Ertragsexport einlesen. '+
+  'Realisierte G/V exakt aus den Cashflows · Marktwerte über Yahoo-Kurse, in EUR umgerechnet über tägliche Devisenkurse · '+
+  'Aktiensplits aus den Buchungsdaten berücksichtigt · Positionen ohne verlässlichen Kurs werden zu Einstand bzw. 0 bewertet · '+
+  (s.div_real ? 'Dividenden = tatsächliche Bargutschriften lt. Konto. '
+              : 'Dividenden = Brutto-Schätzung aus der Ausschüttungshistorie (vor Steuern). ')+
   'Keine Anlageberatung.';
 </script>
 </body>

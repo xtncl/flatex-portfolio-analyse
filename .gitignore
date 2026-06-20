@@ -9,6 +9,9 @@ portfolio_report.html
 cache/
 tickers.json
 
+# Lokale Sonderbewertungen (kann persönliche Bestände enthalten)
+overrides.json
+
 # Logs
 *.log
 

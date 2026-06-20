@@ -61,16 +61,23 @@ werden alle Buchungsarten:
 - **Aktiensplits**: Yahoo liefert split-*bereinigte* Kurse. Stückzahlen werden auf
   die heutige Split-Basis gebracht – die Splitfaktoren kommen **aus den
   Flatex-Daten** (maßgeblich; fehlt eine Maßnahme, Fallback auf Yahoo-Splits).
-  Beispiel NVIDIA: korrekt 17 statt 8 Stück.
-- **Sicherheits-Check**: Weicht der Flatex-Splitfaktor stark vom Yahoo-Faktor ab
-  (z. B. fehlerhafte Yahoo-Daten bei BYD), wird die Position automatisch zu
+- **Sicherheits-Check**: Weicht der aus den Buchungen abgeleitete Splitfaktor stark
+  vom Yahoo-Faktor ab (fehlerhafte Kursdaten), wird die Position automatisch zu
   Einstand bewertet und im Report markiert.
 
-## Sonderfälle (oben im Script unter `SPECIAL`)
-- **InVivo Therapeutics** (US46186M5067): delistet/wertlos → Wert 0.
-- **SpaceX** (US84615Q1031): privat, kein Börsenkurs → zu Einstand bewertet.
-- **BYD**: wird durch den Split-Check automatisch erkannt (Yahoo 18× vs. real 3×)
-  und zu Einstand bewertet – kein manueller Eingriff nötig.
+## Sonderbewertung einzelner Titel (optional, `overrides.json`)
+Für Titel ohne verlässlichen Börsenkurs (delistet, privat, falsch aufgelöst) kann
+eine **nicht versionierte** `overrides.json` im Ordner liegen:
+```json
+{
+  "<ISIN>": "zero",
+  "<ISIN>": "cost"
+}
+```
+`zero` = Marktwert 0, `cost` = Bewertung zu Einstand. Realisierte G/V kommen
+weiterhin exakt aus den Cashflows. Alternativ per `--overrides PFAD`. Die Datei
+bleibt lokal (per `.gitignore` ausgeschlossen) und enthält daher keine Bestände
+im veröffentlichten Repo.
 
 ## Verrechnungskonto (optional): echte Dividenden + Ein-/Auszahlungen
 Liegt zusätzlich der **Kontoumsätze-Export** im Ordner (`;`-getrennt, Spalte
