@@ -248,12 +248,13 @@ def price_eur_series(ticker, index):
 ISIN_RE = re.compile(r"\b([A-Z]{2}[A-Z0-9]{9}[0-9])\b")
 
 def find_flatex_csv():
-    """Findet die Flatex-CSV im Ordner (Header mit Buchungstag/ISIN/Nominal);
-    bei mehreren die mit den meisten Zeilen (= vollstaendigster Export)."""
+    """Findet die Flatex-Wertpapier-CSV im Ordner (Header mit Buchungstag/ISIN/
+    Nominal); bei mehreren die mit den meisten Zeilen. Kodierungs-unabhaengig."""
     best, best_rows = None, -1
     for fp in glob.glob("*.csv"):
         try:
-            with open(fp, encoding="utf-8") as f:
+            enc = _detect_enc(fp)
+            with open(fp, encoding=enc) as f:
                 head = f.readline()
                 if not all(k in head for k in ("Buchungstag", "ISIN", "Nominal")):
                     continue
@@ -263,7 +264,7 @@ def find_flatex_csv():
         except Exception:
             continue
     if not best:
-        sys.exit("Keine Flatex-CSV gefunden (Header mit Buchungstag/ISIN/Nominal).")
+        sys.exit("Keine Flatex-Wertpapier-CSV gefunden (Header mit Buchungstag/ISIN/Nominal).")
     return best
 
 def classify(info):
@@ -277,83 +278,125 @@ def classify(info):
 
 def load_transactions(csv_path):
     """Liest ALLE Buchungen; klassifiziert in buy/sell/corp; liest Ziel-ISIN
-    von Kapitalmassnahmen ('... in ISIN XYZ') aus."""
+    von Kapitalmassnahmen ('... in ISIN XYZ') aus. Robust gegen Kodierung,
+    Trennzeichen und Spaltenreihenfolge."""
+    rows = _read_table(csv_path)
+    if not rows:
+        sys.exit(f"Leere Datei: {csv_path}")
+    cm = _colmap(rows[0])
+    need = [k for k in ("date", "isin", "qty", "betrag", "info") if cm[k] is None]
+    if need:
+        sys.exit(f"Im Wertpapier-Export fehlen Spalten {need}.\nHeader war: {rows[0]}")
+    maxi = max(v for v in cm.values() if v is not None)
     txns = []
-    with open(csv_path, encoding="utf-8") as f:
-        r = csv.reader(f); next(r)
-        for ln in r:
-            if not ln or not ln[0].strip() or len(ln) < 13:
-                continue
-            info = ln[12]
-            kind = classify(info)
-            ref = None
-            if kind == "corp":
-                hits = [m for m in ISIN_RE.findall(info) if m != ln[3]]
-                ref = hits[0] if hits else None        # Ziel-ISIN bei ISIN-Wechsel
-            txns.append(dict(
-                date=datetime.strptime(ln[0], "%d.%m.%Y"),
-                isin=ln[3], name=ln[2], kind=kind,
-                qty=de_num(ln[4]),                       # Nominal Stueck (signiert)
-                betrag=de_num(ln[6]),                    # EUR (+ rein, - raus)
-                kurs=de_num(ln[8]), ref_isin=ref))
+    for ln in rows[1:]:
+        if not ln or len(ln) <= maxi or not ln[cm["date"]].strip():
+            continue
+        info = ln[cm["info"]]
+        kind = classify(info)
+        isin = ln[cm["isin"]].strip()
+        ref = None
+        if kind == "corp":
+            hits = [m for m in ISIN_RE.findall(info) if m != isin]
+            ref = hits[0] if hits else None            # Ziel-ISIN bei ISIN-Wechsel
+        txns.append(dict(
+            date=datetime.strptime(ln[cm["date"]].strip(), "%d.%m.%Y"),
+            isin=isin, name=ln[cm["name"]].strip() if cm["name"] is not None else isin,
+            kind=kind, qty=de_num(ln[cm["qty"]]), betrag=de_num(ln[cm["betrag"]]),
+            kurs=de_num(ln[cm["kurs"]]) if cm["kurs"] is not None else 0.0,
+            ref_isin=ref))
     txns.sort(key=lambda t: (t["date"], 0 if t["kind"] == "corp" else 1))
     return txns
 
 def _detect_enc(path):
-    for enc in ("cp1252", "utf-8", "latin-1"):
+    """Kodierung erkennen: utf-8 ZUERST (schlaegt bei cp1252 sauber fehl),
+    sonst cp1252 (typischer Flatex-Rohexport), zuletzt latin-1."""
+    for enc in ("utf-8", "cp1252", "latin-1"):
         try:
-            open(path, encoding=enc).read(8192)
+            with open(path, encoding=enc) as f:
+                f.read()
             return enc
         except Exception:
             continue
     return "latin-1"
 
+def _read_table(path):
+    """Liest eine Flatex-CSV robust: erkennt Kodierung und Trennzeichen (',' oder
+    ';') selbst. Liefert die Zeilen als Listen."""
+    enc = _detect_enc(path)
+    with open(path, encoding=enc, newline="") as f:
+        header = f.readline()
+        delim = ";" if header.count(";") > header.count(",") else ","
+        f.seek(0)
+        return [row for row in csv.reader(f, delimiter=delim)]
+
+def _colmap(header):
+    """Ordnet benoetigte Spalten ueber ihre Header-Namen den Indizes zu
+    (robust gegen Spaltenreihenfolge/Leerspalten/Namensvarianten)."""
+    idx = [(h.strip().lower(), i) for i, h in enumerate(header)]
+    def col(*prefixes):
+        for pre in prefixes:
+            for name, i in idx:
+                if name.startswith(pre):
+                    return i
+        return None
+    return {"date": col("buchungstag"), "isin": col("isin"),
+            "name": col("bezeichnung"), "qty": col("nominal"),
+            "betrag": col("betrag"), "kurs": col("kurs"),
+            "info": col("buchungsinformation"),
+            "pfl": col("zahlungspfl", "gegenkonto", "auftraggeber")}
+
 def find_cash_csv():
     """Findet den Flatex-Verrechnungskonto-Export im aktuellen Ordner
-    (';'-getrennt, Spalte 'Zahlungspfl.'). Liefert Pfad oder None."""
+    (Spalte 'Zahlungspfl.'). Liefert Pfad oder None. Kodierungs-unabhaengig."""
     for fp in glob.glob("*.csv"):
-        for enc in ("cp1252", "utf-8", "latin-1"):
-            try:
-                head = open(fp, encoding=enc).readline()
-            except Exception:
-                continue
-            if ";" in head and "Zahlungspfl" in head:
-                return fp
-            break
+        try:
+            head = open(fp, encoding=_detect_enc(fp)).readline()
+        except Exception:
+            continue
+        if "Zahlungspfl" in head:
+            return fp
     return None
 
 def load_cash_account(path):
     """Wertet die Kontoumsaetze aus: echte Bardividenden je ISIN, Ein-/Auszahlungen
     (externe Ueberweisungen mit Gegenkonto), Zinsen, Gebuehren, Steuern.
-    Kauf/Verkauf-Cashlegs werden ignoriert (stehen schon im Wertpapierexport)."""
-    enc = _detect_enc(path)
+    Kauf/Verkauf-Cashlegs werden ignoriert (stehen schon im Wertpapierexport).
+    Robust gegen Kodierung, Trennzeichen und Spaltenreihenfolge."""
+    rows = _read_table(path)
+    if not rows:
+        return None
+    cm = _colmap(rows[0])
+    if cm["info"] is None or cm["betrag"] is None:
+        sys.stderr.write(f"   Konto-Export unlesbar (Header: {rows[0]}) – wird ignoriert\n")
+        return None
+    ci, cb, cp = cm["info"], cm["betrag"], cm["pfl"]
+    maxi = max(x for x in (ci, cb, cp) if x is not None)
     div = defaultdict(float)
     deposits = withdrawals = interest = fees = taxes = 0.0
-    div_dates = []
-    with open(path, encoding=enc) as f:
-        r = csv.reader(f, delimiter=";"); next(r)
-        for ln in r:
-            if not ln or not ln[0].strip() or len(ln) < 7:
-                continue
-            info, pfl, betrag = ln[5], ln[3].strip(), de_num(ln[6])
-            low = info.lower()
-            if info.startswith(("Dividendenzahlung", "Erträgnisausschüttung")):
-                m = ISIN_RE.search(info)
-                div[m.group(1) if m else "?"] += betrag
-                div_dates.append(ln[0])
-            elif info.startswith("Ausführung ORDER"):
-                continue                                   # Cashleg -> aus Wertpapierexport
-            elif pfl:                                       # externe Ueberweisung
-                if betrag > 0:
-                    deposits += betrag
-                else:
-                    withdrawals += -betrag
-            elif "zinsab" in low:
-                interest += betrag
-            elif "steuer" in low or info.startswith("Storno"):
-                taxes += betrag
-            elif "gebühr" in low:
-                fees += betrag
+    for ln in rows[1:]:
+        if not ln or len(ln) <= maxi:
+            continue
+        info = ln[ci]
+        betrag = de_num(ln[cb])
+        pfl = ln[cp].strip() if cp is not None else ""
+        low = info.lower()
+        if "dividend" in low or low.startswith("ertr"):       # Dividende/Ausschuettung
+            m = ISIN_RE.search(info)
+            div[m.group(1) if m else "?"] += betrag
+        elif "order" in low and ("kauf" in low or "verkauf" in low):
+            continue                                          # Cashleg -> aus Wertpapierexport
+        elif pfl:                                             # externe Ueberweisung
+            if betrag > 0:
+                deposits += betrag
+            else:
+                withdrawals += -betrag
+        elif "zins" in low:
+            interest += betrag
+        elif "steuer" in low or low.startswith("storno"):
+            taxes += betrag
+        elif "geb" in low and "hr" in low:                    # Gebuehr (umlaut-tolerant)
+            fees += betrag
     return dict(div=dict(div), total_div=sum(div.values()),
                 deposits=deposits, withdrawals=withdrawals,
                 interest=interest, fees=fees, taxes=taxes)
