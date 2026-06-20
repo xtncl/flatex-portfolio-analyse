@@ -486,20 +486,27 @@ def parse_args(argv=None):
     a.transactions = a.transactions or a.transactions_opt
     return a
 
-def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None, overrides_path=None):
+def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None,
+                    overrides_path=None, log=None):
     """Führt die vollständige Portfolio-Analyse durch und gibt (payload, ctx) zurück.
-    payload: Report-Datenstruktur (für HTML-Export und Streamlit-App).
-    ctx:     interne Berechnungsergebnisse für main() (Konsole, CSV, PNG)."""
+    payload: Report-Datenstruktur (für HTML-Export und Flask-Server).
+    ctx:     interne Berechnungsergebnisse für main() (Konsole, CSV, PNG).
+    log:     optionaler Callback(str) für Fortschrittsmeldungen."""
+    _log = log if callable(log) else (lambda m: None)
     global TODAY, CACHE
     TODAY = pd.Timestamp(today).normalize() if today else pd.Timestamp.today().normalize()
     if cache_dir:
         CACHE = cache_dir
     os.makedirs(CACHE, exist_ok=True)
 
+    _log("Transaktionen laden …")
     special_map = load_overrides(overrides_path)
     txns = load_transactions(tx_path)
-    isin2ticker = resolve_tickers({t["isin"] for t in txns} |
-                                  {t["ref_isin"] for t in txns if t["ref_isin"]})
+    _log(f"  {len(txns)} Buchungen geladen")
+
+    isins = {t["isin"] for t in txns} | {t["ref_isin"] for t in txns if t["ref_isin"]}
+    _log(f"Ticker auflösen ({len(isins)} ISINs) …")
+    isin2ticker = resolve_tickers(isins)
     bdays = pd.bdate_range(min(t["date"] for t in txns), TODAY)
 
     isin2grp, groups = build_groups(txns)
@@ -516,6 +523,7 @@ def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None, overrid
                             "txns": [t for t in gtx if t["kind"] in ("buy", "sell")],
                             "all_txns": gtx}
 
+    _log(f"Splits ableiten ({len(instruments)} Positionen) …")
     for gid, ins in instruments.items():
         ins["splits"] = flatex_splits(ins["all_txns"])
         if not ins["splits"] and ins.get("ticker") and not ins["special"] and ins["txns"]:
@@ -539,6 +547,8 @@ def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None, overrid
             incomplete.append(ins["name"])
             incomplete_isins.update(ins["isins"])
 
+    if cash_path:
+        _log("Verrechnungskonto laden (Dividenden) …")
     cash = load_cash_account(cash_path) if cash_path else None
     cash_div = cash["div"] if cash else None
 
@@ -548,6 +558,8 @@ def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None, overrid
     pos_txns = {}
     missing = []
     val_ok = val_bad = 0
+    active_ins = [ins for ins in instruments.values() if not ins["incomplete"]]
+    _log(f"Kurse & Marktwerte abrufen ({len(active_ins)} Titel) …")
     from collections import deque
     for key, ins in sorted(instruments.items(), key=lambda x: x[1]["name"]):
         if ins["incomplete"]:
@@ -660,9 +672,11 @@ def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None, overrid
                          sold_adj=round(sold_adj, 4), cur_px=round(cur_px, 4),
                          special=ins["special"] or ""))
 
+    _log(f"  {len(rows)} Positionen bewertet, {len(missing)} ohne Marktdaten")
     cash_txns = [t for t in txns if t["kind"] in ("buy", "sell")
                  and t["isin"] not in incomplete_isins]
 
+    _log("XIRR & Benchmark berechnen …")
     flow = pd.Series(0.0, index=bdays)
     for t in cash_txns:
         flow.loc[pd.Timestamp(t["date"]):] += t["betrag"]
@@ -741,6 +755,7 @@ def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None, overrid
                            "kind": "Kauf" if t["betrag"] > 0 else "Verkauf",
                            "amt": round(abs(t["betrag"]))})
     events = [ev[d] for d in sorted(ev)]
+    _log("Report zusammenstellen …")
 
     def a(r):
         return None if r is None else {"name": r["name"], "total": float(r["total"]),
