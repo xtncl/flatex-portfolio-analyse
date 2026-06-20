@@ -1,0 +1,11 @@
+services:
+  portfolio:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - portfolio_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  portfolio_data:

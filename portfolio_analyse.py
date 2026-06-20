@@ -486,11 +486,314 @@ def parse_args(argv=None):
     a.transactions = a.transactions or a.transactions_opt
     return a
 
+def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None, overrides_path=None):
+    """Führt die vollständige Portfolio-Analyse durch und gibt (payload, ctx) zurück.
+    payload: Report-Datenstruktur (für HTML-Export und Streamlit-App).
+    ctx:     interne Berechnungsergebnisse für main() (Konsole, CSV, PNG)."""
+    global TODAY, CACHE
+    TODAY = pd.Timestamp(today).normalize() if today else pd.Timestamp.today().normalize()
+    if cache_dir:
+        CACHE = cache_dir
+    os.makedirs(CACHE, exist_ok=True)
+
+    special_map = load_overrides(overrides_path)
+    txns = load_transactions(tx_path)
+    isin2ticker = resolve_tickers({t["isin"] for t in txns} |
+                                  {t["ref_isin"] for t in txns if t["ref_isin"]})
+    bdays = pd.bdate_range(min(t["date"] for t in txns), TODAY)
+
+    isin2grp, groups = build_groups(txns)
+    instruments = {}
+    for gid, isins in groups.items():
+        gtx = sorted((t for t in txns if isin2grp[t["isin"]] == gid),
+                     key=lambda t: t["date"])
+        canon = gtx[-1]["isin"]
+        special = next((special_map[i] for i in isins if i in special_map), None)
+        name = next((t["name"] for t in reversed(gtx) if t["kind"] != "corp"),
+                    gtx[-1]["name"])
+        instruments[gid] = {"name": name, "ticker": isin2ticker.get(canon),
+                            "special": special, "isins": isins,
+                            "txns": [t for t in gtx if t["kind"] in ("buy", "sell")],
+                            "all_txns": gtx}
+
+    for gid, ins in instruments.items():
+        ins["splits"] = flatex_splits(ins["all_txns"])
+        if not ins["splits"] and ins.get("ticker") and not ins["special"] and ins["txns"]:
+            first = pd.Timestamp(min(t["date"] for t in ins["txns"]))
+            ins["splits"] = {d: r for d, r in get_splits(ins["ticker"]).items()
+                             if d > first}
+        for t in ins["txns"]:
+            factor = 1.0
+            for sdate, ratio in ins["splits"].items():
+                if sdate > pd.Timestamp(t["date"]):
+                    factor *= ratio
+            t["adj_qty"] = t["qty"] * factor
+
+    incomplete = []
+    incomplete_isins = set()
+    for gid, ins in instruments.items():
+        ba = sum(t["adj_qty"] for t in ins["txns"] if t["adj_qty"] > 0)
+        sa = sum(-t["adj_qty"] for t in ins["txns"] if t["adj_qty"] < 0)
+        ins["incomplete"] = sa > ba + 1e-6
+        if ins["incomplete"]:
+            incomplete.append(ins["name"])
+            incomplete_isins.update(ins["isins"])
+
+    cash = load_cash_account(cash_path) if cash_path else None
+    cash_div = cash["div"] if cash else None
+
+    portfolio_value = pd.Series(0.0, index=bdays)
+    inst_values = {}
+    rows = []
+    pos_txns = {}
+    missing = []
+    val_ok = val_bad = 0
+    from collections import deque
+    for key, ins in sorted(instruments.items(), key=lambda x: x[1]["name"]):
+        if ins["incomplete"]:
+            continue
+        tx = sorted(ins["txns"], key=lambda t: t["date"])
+        buys  = sum(t["betrag"] for t in tx if t["betrag"] > 0)
+        sells = sum(-t["betrag"] for t in tx if t["betrag"] < 0)
+        pos_txns[ins["name"]] = [
+            {"d": pd.Timestamp(t["date"]).strftime("%d.%m.%Y"),
+             "k": "Kauf" if t["kind"] == "buy" else "Verkauf",
+             "q": round(abs(t["qty"]), 4), "p": round(t["kurs"], 2),
+             "a": round(t["betrag"], 2)} for t in tx]
+
+        buy_adj = sum(t["adj_qty"] for t in tx if t["adj_qty"] > 0)
+
+        lots = deque()
+        realized = 0.0
+        for t in tx:
+            if t["adj_qty"] > 0:
+                lots.append([t["adj_qty"], t["betrag"] / t["adj_qty"]])
+            elif t["adj_qty"] < 0:
+                sell_rest = -t["adj_qty"]
+                price_per = (-t["betrag"]) / sell_rest
+                while sell_rest > 1e-9 and lots:
+                    lot = lots[0]
+                    take = min(sell_rest, lot[0])
+                    realized += take * (price_per - lot[1])
+                    lot[0] -= take; sell_rest -= take
+                    if lot[0] <= 1e-9:
+                        lots.popleft()
+        remaining = sum(l[0] for l in lots)
+        cost_rest = sum(l[0] * l[1] for l in lots)
+        cost_price = (buys / buy_adj) if buy_adj > 1e-9 else 0.0
+        avg_cost   = (cost_rest / remaining) if remaining > 1e-9 else cost_price
+
+        hold = pd.Series(0.0, index=bdays)
+        for t in tx:
+            hold.loc[pd.Timestamp(t["date"]):] += t["adj_qty"]
+
+        if ins["special"] is None and split_mismatch(ins):
+            ins["special"] = "cost"
+            missing.append(f"{ins['name']} (Split Flatex≠Yahoo)")
+
+        pe = None
+        if ins["special"] == "zero":
+            val = pd.Series(0.0, index=bdays)
+        elif ins["special"] == "cost":
+            val = hold * cost_price
+        elif not ins.get("ticker"):
+            val = hold * cost_price
+            missing.append(ins["name"])
+        else:
+            pe = price_eur_series(ins["ticker"], bdays)
+            if pe is None:
+                val = hold * cost_price
+                missing.append(f"{ins['name']} ({ins['ticker']})")
+            else:
+                val = hold * pe
+
+        if cash_div is not None:
+            div_total = sum(cash_div.get(i, 0.0) for i in ins["isins"])
+        else:
+            div_total = 0.0
+            tk = ins.get("ticker")
+            if tk and not ins["special"]:
+                ccy = get_currency(tk) or "USD"
+                fxf = fx_series(ccy, bdays)
+                for dt, dps in get_dividends(tk).items():
+                    if bdays[0] <= dt <= bdays[-1]:
+                        sh = hold.asof(dt)
+                        if pd.notna(sh) and sh > 1e-9:
+                            fv = fxf.asof(dt)
+                            div_total += sh * dps * (fv if pd.notna(fv) else 1.0)
+
+        if pe is not None:
+            splits = ins["splits"]
+            for t in tx:
+                if t["qty"] > 0 and t["kurs"] > 0:
+                    f = 1.0
+                    for sdate, ratio in splits.items():
+                        if sdate > pd.Timestamp(t["date"]):
+                            f *= ratio
+                    d = pd.Timestamp(t["date"])
+                    model = pe.reindex([d]).ffill().iloc[0]
+                    if pd.notna(model) and model > 0:
+                        recon = model * f
+                        if abs(recon / t["kurs"] - 1) < 0.30:
+                            val_ok += 1
+                        else:
+                            val_bad += 1
+
+        val = val.fillna(0.0)
+        portfolio_value += val
+        inst_values[ins["name"]] = val
+        cur_val = float(val.iloc[-1])
+        unreal = cur_val - cost_rest
+        if ins["special"] == "zero":
+            cur_px = 0.0
+        elif ins["special"] == "cost" or pe is None:
+            cur_px = cost_price
+        else:
+            cur_px = float(pe.iloc[-1])
+        sold_adj = sum(-t["adj_qty"] for t in tx if t["adj_qty"] < 0)
+        rows.append(dict(name=ins["name"], ticker=ins.get("ticker") or "-",
+                         shares_now=round(remaining, 4), avg_cost=round(avg_cost, 2),
+                         buys=round(buys, 2), sells=round(sells, 2),
+                         cur_value=round(cur_val, 2), dividends=round(div_total, 2),
+                         realized=round(realized, 2), unrealized=round(unreal, 2),
+                         total=round(realized + unreal, 2),
+                         sold_adj=round(sold_adj, 4), cur_px=round(cur_px, 4),
+                         special=ins["special"] or ""))
+
+    cash_txns = [t for t in txns if t["kind"] in ("buy", "sell")
+                 and t["isin"] not in incomplete_isins]
+
+    flow = pd.Series(0.0, index=bdays)
+    for t in cash_txns:
+        flow.loc[pd.Timestamp(t["date"]):] += t["betrag"]
+    net_invested = flow
+
+    bench_pe = price_eur_series(BENCH_TICKER, bdays)
+    bench_value = None
+    if bench_pe is not None:
+        units = pd.Series(0.0, index=bdays)
+        for t in cash_txns:
+            d = pd.Timestamp(t["date"])
+            p = bench_pe.loc[d] if d in bench_pe.index else bench_pe.reindex([d]).ffill().iloc[0]
+            if p and p > 0:
+                units.loc[d:] += t["betrag"] / p
+        bench_value = units * bench_pe
+
+    df = pd.DataFrame(rows).sort_values("total", ascending=False).reset_index(drop=True)
+    df["returned"] = df["sells"] + df["cur_value"]
+    df["ret_pct"]  = df["total"] / df["buys"] * 100
+    df["status"] = df.apply(
+        lambda r: "offen" if (r["shares_now"] > 0.01 and r["sells"] < 0.01)
+        else ("teilw. verkauft" if r["shares_now"] > 0.01 else "verkauft"), axis=1)
+    df["wert_heute_verkauft"] = df["sold_adj"] * df["cur_px"]
+    df["timing"] = df["wert_heute_verkauft"] - df["sells"]
+    df.loc[df["sold_adj"] < 0.01, "timing"] = 0.0
+    df.loc[df["special"] == "cost", "timing"] = 0.0
+
+    cur_value   = float(portfolio_value.iloc[-1])
+    invested    = float(net_invested.iloc[-1])
+    total_buys  = sum(t["betrag"] for t in cash_txns if t["betrag"] > 0)
+    total_sells = sum(-t["betrag"] for t in cash_txns if t["betrag"] < 0)
+    total_pl    = cur_value - invested
+    realized_pl = df["realized"].sum()
+    unreal_pl   = df["unrealized"].sum()
+
+    flows = [(pd.Timestamp(t["date"]), -t["betrag"]) for t in cash_txns]
+    r_port  = xirr(flows + [(TODAY, cur_value)])
+    r_bench = xirr(flows + [(TODAY, float(bench_value.iloc[-1]))]) if bench_value is not None else None
+
+    best   = df.loc[df["total"].idxmax()]
+    worst  = df.loc[df["total"].idxmin()]
+    bestp  = df.loc[df["ret_pct"].idxmax()]
+    worstp = df[df["buys"] > 0].loc[df[df["buys"] > 0]["ret_pct"].idxmin()]
+    sold   = df[df["sold_adj"] > 0.01]
+    early  = sold.loc[sold["timing"].idxmax()] if len(sold) else None
+    smart  = sold.loc[sold["timing"].idxmin()] if len(sold) else None
+
+    inst_df = pd.DataFrame(inst_values).reindex(bdays).fillna(0.0)
+    wk = inst_df.resample("W-FRI").last().ffill().fillna(0.0)
+    pv_w  = portfolio_value.resample("W-FRI").last().ffill()
+    ni_w  = net_invested.resample("W-FRI").last().ffill()
+    bn_w  = bench_value.resample("W-FRI").last().ffill() if bench_value is not None else None
+    dates = [d.strftime("%Y-%m-%d") for d in wk.index]
+
+    peak = wk.max()
+    last = wk.iloc[-1]
+    active  = [c for c in wk.columns if peak[c] > 0.5]
+    ordered = sorted(active, key=lambda n: (float(last[n]), float(peak[n])), reverse=True)
+    CAP = 24
+    chosen, others = ordered[:CAP], ordered[CAP:]
+    stack_labels = list(chosen) + (["Sonstige"] if others else [])
+    stack_series = [[round(v, 2) for v in wk[n].values] for n in chosen]
+    if others:
+        stack_series.append([round(v, 2) for v in wk[others].sum(axis=1).values])
+
+    name2label = {n: n for n in chosen}
+    for n in others:
+        name2label[n] = "Sonstige"
+    ev = {}
+    for t in cash_txns:
+        gid = isin2grp.get(t["isin"])
+        iname = instruments[gid]["name"] if gid in instruments else t["name"]
+        d = pd.Timestamp(t["date"]).strftime("%Y-%m-%d")
+        e = ev.setdefault(d, {"date": d, "items": []})
+        e["items"].append({"name": iname, "label": name2label.get(iname, "Sonstige"),
+                           "kind": "Kauf" if t["betrag"] > 0 else "Verkauf",
+                           "amt": round(abs(t["betrag"]))})
+    events = [ev[d] for d in sorted(ev)]
+
+    def a(r):
+        return None if r is None else {"name": r["name"], "total": float(r["total"]),
+                                       "ret_pct": float(r["ret_pct"]), "timing": float(r["timing"]),
+                                       "sells": float(r["sells"]),
+                                       "wert_heute": float(r["wert_heute_verkauft"])}
+    payload = {
+        "today": TODAY.strftime("%d.%m.%Y"),
+        "incomplete": incomplete,
+        "stats": {"total_pl": total_pl, "cur_value": cur_value, "invested": invested,
+                  "buys": total_buys, "sells": total_sells, "realized": realized_pl,
+                  "unreal": unreal_pl, "dividends": float(df["dividends"].sum()),
+                  "div_real": bool(cash),
+                  "deposits": cash["deposits"] if cash else None,
+                  "withdrawals": cash["withdrawals"] if cash else None,
+                  "interest": cash["interest"] if cash else None,
+                  "fees": cash["fees"] if cash else None,
+                  "xirr": (r_port or 0) * 100,
+                  "bench": float(bench_value.iloc[-1]) if bench_value is not None else None,
+                  "bench_xirr": (r_bench or 0) * 100 if bench_value is not None else None},
+        "dates": dates,
+        "line": {"depot": [round(v, 2) for v in pv_w.values],
+                 "invested": [round(v, 2) for v in ni_w.values],
+                 "diff": [round(float(d) - float(i), 2) for d, i in zip(pv_w.values, ni_w.values)],
+                 "bench": [round(v, 2) for v in bn_w.values] if bn_w is not None else None},
+        "stack": {"labels": stack_labels, "series": stack_series},
+        "events": events,
+        "positions": [{"name": r["name"].title(), "ticker": r["ticker"], "status": r["status"],
+                       "buys": r["buys"], "returned": r["returned"], "cur_value": r["cur_value"],
+                       "dividends": r["dividends"], "realized": r["realized"],
+                       "unrealized": r["unrealized"], "total": r["total"],
+                       "ret_pct": r["ret_pct"], "timing": r["timing"],
+                       "txns": pos_txns.get(r["name"], [])}
+                      for _, r in df.sort_values("total", ascending=False).iterrows()],
+        "analysis": {"best": a(best), "bestp": a(bestp), "worst": a(worst),
+                     "worstp": a(worstp), "early": a(early), "smart": a(smart)},
+    }
+    ctx = {
+        "df": df, "net_invested": net_invested, "portfolio_value": portfolio_value,
+        "bench_value": bench_value, "r_port": r_port, "r_bench": r_bench,
+        "cur_value": cur_value, "invested": invested, "total_pl": total_pl,
+        "total_buys": total_buys, "total_sells": total_sells,
+        "div_total": float(df["dividends"].sum()), "cash": cash,
+        "val_ok": val_ok, "val_bad": val_bad,
+        "incomplete": incomplete, "missing": missing,
+        "best": best, "worst": worst, "bestp": bestp, "worstp": worstp,
+        "early": early, "smart": smart,
+    }
+    return payload, ctx
+
+
 def main(args=None):
     args = args if args is not None else parse_args()
-    global TODAY
-    if args.today:
-        TODAY = pd.Timestamp(args.today).normalize()
     # Eingaben im Aufruf-Ordner suchen und zu absoluten Pfaden machen
     tx_path = os.path.abspath(args.transactions) if args.transactions else \
               os.path.abspath(find_flatex_csv())
@@ -506,21 +809,101 @@ def main(args=None):
     for label, pth in (("Wertpapier-Export", tx_path), ("Konto-Export", cash_path)):
         if pth and not os.path.exists(pth):
             sys.exit(f"Datei nicht gefunden: {pth}")
-    # Ausgabeordner: Report/CSV/Cache landen hier
     os.makedirs(args.outdir, exist_ok=True)
     os.chdir(args.outdir)
     os.makedirs(CACHE, exist_ok=True)
     print(f"  Wertpapier-Export : {tx_path}")
     print(f"  Konto-Export      : {cash_path or '(keiner – Dividenden werden geschätzt)'}")
 
-    special_map = load_overrides(ovr_path)
-    txns = load_transactions(tx_path)
-    isin2ticker = resolve_tickers({t["isin"] for t in txns} |
-                                  {t["ref_isin"] for t in txns if t["ref_isin"]})
-    bdays = pd.bdate_range(min(t["date"] for t in txns), TODAY)
+    payload, ctx = compute_payload(tx_path, cash_path, cache_dir=CACHE,
+                                   today=args.today, overrides_path=ovr_path)
+    df      = ctx["df"]
+    cash    = ctx["cash"]
+    best    = ctx["best"];  worst  = ctx["worst"]
+    bestp   = ctx["bestp"]; worstp = ctx["worstp"]
+    early   = ctx["early"]; smart  = ctx["smart"]
 
-    # ISINs zu Positionen verschmelzen (per Kapitalmassnahme verbundene ISINs)
-    isin2grp, groups = build_groups(txns)
+    def eur(x): return f"{x:,.2f} EUR".replace(",", "X").replace(".", ",").replace("X", ".")
+    def pct(r): return "n/a" if r is None else f"{r*100:+.1f} % p.a."
+
+    print("\n" + "=" * 64)
+    print("  PORTFOLIO-ZUSAMMENFASSUNG  (Stand " + TODAY.strftime("%d.%m.%Y") + ")")
+    print("=" * 64)
+    print(f"  Gesamt gekauft (eingezahlt) : {eur(ctx['total_buys'])}")
+    print(f"  Gesamt verkauft (ausgezahlt): {eur(ctx['total_sells'])}")
+    print(f"  Noch investiert (netto)     : {eur(ctx['invested'])}")
+    print(f"  Aktueller Depotwert         : {eur(ctx['cur_value'])}")
+    print("  " + "-" * 60)
+    print(f"  Realisierte G/V (verkauft)  : {eur(payload['stats']['realized'])}")
+    print(f"  Unrealisierte G/V (offen)   : {eur(payload['stats']['unreal'])}")
+    print(f"  GESAMT-GEWINN/-VERLUST      : {eur(ctx['total_pl'])}   "
+          f"({ctx['total_pl']/ctx['invested']*100:+.1f} % auf netto investiertes Kapital)")
+    div_lbl = "netto, lt. Konto" if cash else "brutto, geschätzt"
+    print(f"  Dividenden ({div_lbl}): {eur(ctx['div_total'])}")
+    print(f"  Gesamtertrag inkl. Dividenden : {eur(ctx['total_pl'] + ctx['div_total'])}")
+    print(f"  Jahresrendite (geldgewichtet, XIRR): {pct(ctx['r_port'])}")
+    if cash:
+        print("  " + "-" * 60)
+        print(f"  Auf Flatex eingezahlt       : {eur(cash['deposits'])}")
+        print(f"  Auf andere Konten ausgezahlt: {eur(cash['withdrawals'])}")
+        print(f"  Netto eingezahlt            : {eur(cash['deposits'] - cash['withdrawals'])}")
+        print(f"  Zinsen/Gebühren gezahlt     : {eur(-(cash['interest'] + cash['fees']))}")
+    print("=" * 64)
+    print("  Vergleich: waerst du besser dran gewesen ...")
+    print(f"    ... GAR NICHT investiert (Cash, 0% p.a.):")
+    print(f"          Investieren brachte dir {eur(ctx['total_pl'])}  ->  JA, klar besser investiert")
+    bench_value = ctx["bench_value"]
+    if bench_value is not None:
+        bv = float(bench_value.iloc[-1])
+        diff = bv - ctx["cur_value"]
+        print(f"    ... alles stur in den MSCI World ({pct(ctx['r_bench'])}):")
+        print(f"          {eur(bv)} statt {eur(ctx['cur_value'])}  ->  "
+              f"waere {eur(abs(diff))} {'MEHR' if diff>0 else 'WENIGER'} gewesen")
+    print("=" * 64)
+    print("\n  BESTE ENTSCHEIDUNG:")
+    print(f"    + Größter Gewinn : {best['name'][:28]:28} {eur(best['total'])}  "
+          f"({best['ret_pct']:+.0f} %)")
+    print(f"    + Beste Rendite  : {bestp['name'][:28]:28} {bestp['ret_pct']:+.0f} %  "
+          f"({eur(bestp['total'])})")
+    if smart is not None and smart["timing"] < -20:
+        print(f"    + Bester Ausstieg: {smart['name'][:28]:28} "
+              f"{eur(-smart['timing'])} weniger Verlust durch Verkauf")
+    print("\n  GRÖSSTER FEHLER:")
+    print(f"    - Größter Verlust: {worst['name'][:28]:28} {eur(worst['total'])}  "
+          f"({worst['ret_pct']:+.0f} %)")
+    print(f"    - Schlecht. Rend.: {worstp['name'][:28]:28} {worstp['ret_pct']:+.0f} %  "
+          f"({eur(worstp['total'])})")
+    if early is not None and early["timing"] > 20:
+        print(f"    - Zu früh verkauft: {early['name'][:27]:27} "
+              f"{eur(early['timing'])} entgangener Gewinn "
+              f"(verkauft für {eur(early['sells'])}, heute {eur(early['wert_heute_verkauft'])} wert)")
+    print("=" * 64)
+    render_table(df, eur)
+    if ctx["missing"]:
+        print("\n  Hinweis - ohne Marktdaten (zu Einstand bewertet): " + ", ".join(ctx["missing"]))
+    if ctx["incomplete"]:
+        print("\n  Achtung: Mehr verkauft als gekauft (Kauf liegt vermutlich VOR dem Export):")
+        print("    " + ", ".join(ctx["incomplete"]))
+        print("    -> Für korrekte Zahlen den vollständigen Flatex-Export ab "
+              "Depoteröffnung verwenden.")
+    if ctx["val_ok"] + ctx["val_bad"]:
+        print(f"\n  Validierung Kaufkurse vs. Marktdaten: {ctx['val_ok']}/{ctx['val_ok']+ctx['val_bad']} "
+              f"Käufe stimmen (±30%) überein.")
+    open_neg = df[df["shares_now"] < -0.01]
+    if len(open_neg):
+        print("  WARN negative Restbestände:", list(open_neg["name"]))
+    print(f"\n  Details je Position -> {OUT_CSV}")
+
+    df.to_csv(OUT_CSV, index=False)
+    make_plot(ctx["net_invested"], ctx["portfolio_value"], bench_value,
+              ctx["total_pl"], ctx["cur_value"], ctx["invested"], ctx["r_port"], ctx["r_bench"])
+    print(f"  Graph   -> {OUT_PNG}")
+    export_html(payload)
+    print(f"  Report  -> {OUT_HTML}\n")
+
+
+if False:  # tot – alter main()-Körper, ersetzt durch compute_payload()
+    _dummy_isin2grp, _dummy_groups = build_groups([])  # verhindert NameError bei import
     instruments = {}
     for gid, isins in groups.items():
         gtx = sorted((t for t in txns if isin2grp[t["isin"]] == gid),

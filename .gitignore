@@ -11,6 +11,9 @@ cache/
 tickers.json
 crypto_tickers.json
 
+# Streamlit-App: Datenbank und Cache-Verzeichnis
+data/
+
 # Lokale Sonderbewertungen (kann persönliche Bestände enthalten)
 overrides.json
 

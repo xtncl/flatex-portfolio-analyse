@@ -1,8 +1,12 @@
-# Abhängigkeiten für portfolio_analyse.py  (Python 3.9+)
+# Abhängigkeiten für portfolio_analyse.py + portfolio_app.py  (Python 3.9+)
 # Installation:  pip install -r requirements.txt
 yfinance>=0.2.40
 pandas>=1.5
 matplotlib>=3.5
+
+# Streamlit-App (portfolio_app.py)
+streamlit>=1.35
+plotly>=5.20
 
 # Hinweise:
 # - Internetzugang nötig (Yahoo Finance: Kurse, Devisen, Splits, ISIN-Suche).
