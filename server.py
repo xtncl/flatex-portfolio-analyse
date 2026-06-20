@@ -8,7 +8,8 @@ Lokal starten:
 Docker:
     docker compose up --build
 """
-import hashlib, json, os, queue, shutil, sqlite3, tempfile, threading
+import glob as _glob
+import hashlib, json, os, queue, shutil, sqlite3, tempfile, threading, time
 from datetime import datetime
 
 from flask import Flask, Response, redirect, request, stream_with_context, url_for
@@ -71,6 +72,121 @@ def row_counts(con):
     d = con.execute("SELECT COUNT(*) FROM depot_rows").fetchone()[0]
     k = con.execute("SELECT COUNT(*) FROM konto_rows").fetchone()[0]
     return d, k
+
+# ---------------------------------------------------------------- Hintergrund-Refresh
+_refresh_lock  = threading.Lock()
+_refresh_state = {"running": False, "last_updated": None, "error": None}
+
+def _run_refresh():
+    """Vollständige Analyse neu ausführen und Report in DB speichern. Thread-sicher."""
+    if not _refresh_lock.acquire(blocking=False):
+        return
+    tx_path = cash_path = None
+    try:
+        _refresh_state["running"] = True
+        con = get_db()
+        if con.execute("SELECT COUNT(*) FROM depot_rows").fetchone()[0] == 0:
+            con.close()
+            return
+        tx_path   = export_temp(con, "depot_rows")
+        cash_path = export_temp(con, "konto_rows")
+        # last_updated aus DB lesen (für Initialisierung)
+        row = con.execute("SELECT value FROM meta WHERE key='last_updated'").fetchone()
+        if row and not _refresh_state["last_updated"]:
+            _refresh_state["last_updated"] = row[0]
+        con.close()
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        payload, _ = pa.compute_payload(tx_path, cash_path, cache_dir=CACHE_DIR)
+        html = pa._HTML_TEMPLATE.replace(
+            "__PAYLOAD__", json.dumps(payload, ensure_ascii=False))
+        now = datetime.now().isoformat(timespec="seconds")
+        con = get_db()
+        con.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("last_report", html))
+        con.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("last_updated", now))
+        con.commit()
+        con.close()
+        _refresh_state["last_updated"] = now
+        _refresh_state["error"] = None
+    except Exception as exc:
+        _refresh_state["error"] = str(exc)
+    finally:
+        _refresh_state["running"] = False
+        _refresh_lock.release()
+        for p in (tx_path, cash_path):
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+def _background_loop():
+    time.sleep(10)  # kurzer Anlauf-Delay
+    while True:
+        _run_refresh()
+        time.sleep(60)
+
+threading.Thread(target=_background_loop, daemon=True).start()
+
+# ---------------------------------------------------------------- Report-Overlay (wird in /report injiziert)
+_REPORT_OVERLAY = r"""<style>
+#_pa{position:fixed;bottom:1.2rem;right:1.2rem;z-index:9999;
+     background:#fff;border:1px solid #ddd;border-radius:12px;
+     box-shadow:0 4px 20px rgba(0,0,0,.15);padding:.75rem 1rem;
+     font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+     color:#444;min-width:195px}
+#_pa-ts{font-size:11px;color:#888;margin-bottom:.55rem;display:flex;
+        align-items:center;gap:6px;min-height:16px}
+#_pa-spin{width:12px;height:12px;border:2px solid #ddd;border-top-color:#2166ac;
+          border-radius:50%;animation:_sp 1s linear infinite;display:none;flex-shrink:0}
+@keyframes _sp{to{transform:rotate(360deg)}}
+#_pa-row{display:flex;gap:.4rem}
+._pa-btn{flex:1;text-align:center;padding:.38rem .5rem;border-radius:7px;
+         font-size:12px;font-weight:600;text-decoration:none;cursor:pointer;
+         border:1px solid #ccc;background:#fff;color:#444;transition:background .15s;
+         white-space:nowrap}
+._pa-btn:hover{background:#f0f0f0}
+._pa-btn.p{background:#2166ac;color:#fff;border:none}
+._pa-btn.p:hover{opacity:.85}
+</style>
+<div id="_pa">
+  <div id="_pa-ts"><div id="_pa-spin"></div><span id="_pa-txt">Lädt …</span></div>
+  <div id="_pa-row">
+    <a href="/upload" class="_pa-btn">⬆ Importieren</a>
+    <button class="_pa-btn p" onclick="_paRefresh()" title="Kurse jetzt aktualisieren">↺ Aktualisieren</button>
+  </div>
+</div>
+<script>
+(function(){
+var ts=null,
+    spin=document.getElementById('_pa-spin'),
+    txt=document.getElementById('_pa-txt');
+function fmt(iso){
+  if(!iso)return'—';
+  var d=new Date(iso);
+  return d.toLocaleTimeString('de-AT',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function poll(){
+  fetch('/api/status').then(function(r){return r.json();}).then(function(d){
+    spin.style.display=d.refreshing?'block':'none';
+    if(d.last_updated){
+      txt.textContent=(d.refreshing?'Aktualisiert … ':'Stand: ')+fmt(d.last_updated);
+      if(ts&&d.last_updated!==ts){window.location.reload();}
+      ts=d.last_updated;
+    } else {
+      txt.textContent=d.refreshing?'Aktualisiert …':'—';
+    }
+  }).catch(function(){});
+}
+window._paRefresh=function(){
+  spin.style.display='block';
+  txt.textContent='Aktualisiert …';
+  fetch('/refresh').catch(function(){});
+};
+poll();
+setInterval(poll,10000);
+})();
+</script>
+</body>"""
 
 # ---------------------------------------------------------------- Upload-Seite
 _CSS = """
@@ -142,6 +258,12 @@ def _page(depot_cnt, konto_cnt, messages=None):
         items = "".join(f"<li>{m}</li>" for m in messages)
         msgs_html = f'<ul class="msgs">{items}</ul>'
     analyse_cls = "" if depot_cnt > 0 else " disabled"
+    con = get_db()
+    has_report = con.execute(
+        "SELECT 1 FROM meta WHERE key='last_report'").fetchone() is not None
+    con.close()
+    report_btn = ('<a href="/report" class="btn btn-primary">Report anzeigen</a>'
+                  if has_report else "")
     return f"""<!doctype html>
 <html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -181,6 +303,7 @@ def _page(depot_cnt, konto_cnt, messages=None):
       <div class="actions">
         <button type="submit" class="btn btn-secondary">Importieren</button>
         <a href="/analyse" class="btn btn-primary{analyse_cls}">Analysieren</a>
+        {report_btn}
         <a href="/clear-cache" class="btn btn-secondary"
            onclick="return confirm('Kurs-Cache leeren?')">Cache leeren</a>
         <a href="/reset" class="btn btn-danger"
@@ -286,6 +409,16 @@ es.onerror = () => {{
 @app.route("/")
 def index():
     con = get_db()
+    has_report = con.execute(
+        "SELECT 1 FROM meta WHERE key='last_report'").fetchone() is not None
+    con.close()
+    if has_report:
+        return redirect(url_for("report"))
+    return redirect(url_for("upload"))
+
+@app.route("/upload")
+def upload():
+    con = get_db()
     d, k = row_counts(con)
     con.close()
     return _page(d, k)
@@ -357,12 +490,15 @@ def analyse_stream():
             if typ == "log":
                 yield f"data: {json.dumps({'type':'log','msg':data})}\n\n"
             elif typ == "done":
-                # Report in DB speichern
+                now = datetime.now().isoformat(timespec="seconds")
                 con = get_db()
                 con.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
                             ("last_report", result["html"]))
+                con.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                            ("last_updated", now))
                 con.commit()
                 con.close()
+                _refresh_state["last_updated"] = now
                 yield f"data: {json.dumps({'type':'done'})}\n\n"
                 break
             elif typ == "error":
@@ -375,20 +511,31 @@ def analyse_stream():
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
+@app.route("/api/status")
+def api_status():
+    return {"last_updated": _refresh_state["last_updated"],
+            "refreshing":   _refresh_state["running"]}
+
+@app.route("/refresh")
+def manual_refresh():
+    threading.Thread(target=_run_refresh, daemon=True).start()
+    return {"ok": True}
+
 @app.route("/report")
 def report():
     con = get_db()
     row = con.execute("SELECT value FROM meta WHERE key='last_report'").fetchone()
     con.close()
     if not row:
-        return redirect(url_for("index"))
-    return Response(row[0], content_type="text/html; charset=utf-8")
+        return redirect(url_for("upload"))
+    html = row[0].replace("</body>", _REPORT_OVERLAY)
+    return Response(html, content_type="text/html; charset=utf-8")
 
 @app.route("/clear-cache")
 def clear_cache():
     if os.path.exists(CACHE_DIR):
         shutil.rmtree(CACHE_DIR)
-    return redirect(url_for("index"))
+    return redirect(url_for("upload"))
 
 @app.route("/reset")
 def reset():
@@ -397,7 +544,8 @@ def reset():
         con.execute(f"DELETE FROM {tbl}")
     con.commit()
     con.close()
-    return redirect(url_for("index"))
+    _refresh_state["last_updated"] = None
+    return redirect(url_for("upload"))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))

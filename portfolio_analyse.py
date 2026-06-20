@@ -114,7 +114,7 @@ def _yahoo_search_isin(isin):
 
 def resolve_tickers(isins):
     """ISIN -> Ticker fuer alle ISINs; Ergebnis wird in tickers.json gecached."""
-    fp = "tickers.json"
+    fp = os.path.join(CACHE, "tickers.json")
     cache = {}
     if os.path.exists(fp):
         raw = json.load(open(fp, encoding="utf-8"))
@@ -151,6 +151,21 @@ def get_hist(ticker):
     if os.path.exists(fp):
         s = pd.read_csv(fp, index_col=0, parse_dates=True).iloc[:, 0]
         s.name = ticker
+        # Inkrementell aktualisieren wenn Cache älter als heute
+        if not s.empty and pd.Timestamp(s.index[-1]).date() < TODAY.date():
+            start = (pd.Timestamp(s.index[-1]) - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+            end   = (TODAY + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            upd = _retry(lambda: yf.download(ticker, start=start, end=end,
+                                              auto_adjust=False, progress=False, threads=False))
+            if upd is not None and not upd.empty:
+                c2 = upd["Close"]
+                if isinstance(c2, pd.DataFrame):
+                    c2 = c2.iloc[:, 0]
+                c2.index = pd.to_datetime(c2.index).tz_localize(None)
+                c2 = c2.dropna()
+                s = pd.concat([s[s.index < c2.index[0]], c2]).sort_index()
+                s.to_frame("close").to_csv(fp)
+                time.sleep(0.3)
         return s
     df = _retry(lambda: yf.download(ticker, start="2020-12-01",
                                     end=(TODAY + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
