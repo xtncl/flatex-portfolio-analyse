@@ -2,7 +2,7 @@ services:
   portfolio:
     build: .
     ports:
-      - "8501:8501"
+      - "8080:8080"
     volumes:
       - portfolio_data:/app/data
     restart: unless-stopped
