@@ -292,8 +292,9 @@ with st.sidebar:
         st.session_state.pop("run", None)
         st.rerun()
 
-# Analyse ausführen
+# Analyse ausführen (nur einmalig nach Button-Klick, nicht bei jedem Rerun)
 if st.session_state.get("run") and depot_cnt > 0:
+    st.session_state["run"] = False   # sofort zurücksetzen – verhindert Re-Analyse bei Rerun
     tx_path = cash_path = None
     try:
         with st.spinner("Analysiere Portfolio (Kurse werden abgerufen)…"):
@@ -303,6 +304,7 @@ if st.session_state.get("run") and depot_cnt > 0:
             payload, _ = pa.compute_payload(
                 tx_path, cash_path, cache_dir=CACHE_DIR)
             st.session_state["payload"] = payload
+            st.session_state["analysed_at"] = datetime.now().strftime("%d.%m.%Y %H:%M")
     except Exception as e:
         st.error(f"Fehler bei der Analyse: {e}")
         raise
@@ -320,7 +322,9 @@ if not payload:
 stats = payload["stats"]
 
 # KPI-Karten
-st.subheader(f"Stand {payload['today']}")
+analysed_at = st.session_state.get("analysed_at", "")
+ts_suffix = f" · analysiert {analysed_at}" if analysed_at else ""
+st.subheader(f"Stand {payload['today']}{ts_suffix}")
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Depotwert",         eur_plain(stats["cur_value"]))
 k2.metric("Investiert (netto)", eur_plain(stats["invested"]))
