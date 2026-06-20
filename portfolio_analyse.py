@@ -570,6 +570,7 @@ def main(args=None):
     portfolio_value = pd.Series(0.0, index=bdays)
     inst_values = {}          # Name -> tägliche Wert-Zeitreihe (für Stacked-Chart)
     rows = []
+    pos_txns = {}             # Name -> Kauf-/Verkauf-Historie (für Tabellen-Detailansicht)
     missing = []
     val_ok = val_bad = 0
     from collections import deque
@@ -579,6 +580,12 @@ def main(args=None):
         tx = sorted(ins["txns"], key=lambda t: t["date"])
         buys  = sum(t["betrag"] for t in tx if t["betrag"] > 0)
         sells = sum(-t["betrag"] for t in tx if t["betrag"] < 0)
+        # Kauf-/Verkauf-Historie je Position (für die Detailansicht in der Tabelle)
+        pos_txns[ins["name"]] = [
+            {"d": pd.Timestamp(t["date"]).strftime("%d.%m.%Y"),
+             "k": "Kauf" if t["kind"] == "buy" else "Verkauf",
+             "q": round(abs(t["qty"]), 4), "p": round(t["kurs"], 2),
+             "a": round(t["betrag"], 2)} for t in tx]
 
         buy_adj = sum(t["adj_qty"] for t in tx if t["adj_qty"] > 0)     # gekaufte Stk.
 
@@ -806,7 +813,7 @@ def main(args=None):
     if missing:
         print("\n  Hinweis - ohne Marktdaten (zu Einstand bewertet): " + ", ".join(missing))
     if incomplete:
-        print("\n  ⚠ Mehr verkauft als gekauft (Kauf liegt vermutlich VOR dem Export):")
+        print("\n  Achtung: Mehr verkauft als gekauft (Kauf liegt vermutlich VOR dem Export):")
         print("    " + ", ".join(incomplete))
         print("    -> Für korrekte Zahlen den vollständigen Flatex-Export ab "
               "Depoteröffnung verwenden.")
@@ -833,17 +840,37 @@ def main(args=None):
     bn_w  = bench_value.resample("W-FRI").last().ffill() if bench_value is not None else None
     dates = [d.strftime("%Y-%m-%d") for d in wk.index]
 
-    # Stacking: aktuell offene + größte historische Positionen, Rest -> "Sonstige"
-    peak = wk.max().sort_values(ascending=False)
-    open_names = set(df[df["cur_value"] > 0.5]["name"])
-    chosen = list(dict.fromkeys([n for n in peak.index if n in open_names] +
-                                [n for n in peak.index]))[:13]
-    chosen = sorted(chosen, key=lambda n: wk[n].iloc[-1], reverse=True)
-    others = [c for c in wk.columns if c not in chosen]
-    stack_labels = list(chosen) + (["Sonstige (verkauft)"] if others else [])
+    # Stacking: ALLE jemals gehaltenen Positionen einzeln (auch laengst verkaufte),
+    # damit das Chart zu jedem Zeitpunkt die damalige Zusammensetzung zeigt. Nur ein
+    # kleiner, vernachlaessigbarer Rest (Peak-Wert <0,5 €) wandert in "Sonstige".
+    peak = wk.max()
+    last = wk.iloc[-1]
+    active  = [c for c in wk.columns if peak[c] > 0.5]
+    ordered = sorted(active, key=lambda n: (float(last[n]), float(peak[n])), reverse=True)
+    CAP = 24
+    chosen, others = ordered[:CAP], ordered[CAP:]
+    stack_labels = list(chosen) + (["Sonstige"] if others else [])
     stack_series = [[round(v, 2) for v in wk[n].values] for n in chosen]
     if others:
         stack_series.append([round(v, 2) for v in wk[others].sum(axis=1).values])
+
+    # Ereignisse (Kaeufe/Verkaeufe) je Tag -> Vertikallinien + Hover-Marker in den Charts.
+    # Jeder Eintrag traegt den kanonischen Positionsnamen und das zugehoerige Stack-Label
+    # ("Sonstige" fuer gebuendelte Titel), damit die JS-Seite die Ereignisse passend zu den
+    # eingeblendeten Positionen filtern kann.
+    name2label = {n: n for n in chosen}
+    for n in others:
+        name2label[n] = "Sonstige"
+    ev = {}
+    for t in cash_txns:
+        gid = isin2grp.get(t["isin"])
+        iname = instruments[gid]["name"] if gid in instruments else t["name"]
+        d = pd.Timestamp(t["date"]).strftime("%Y-%m-%d")
+        e = ev.setdefault(d, {"date": d, "items": []})
+        e["items"].append({"name": iname, "label": name2label.get(iname, "Sonstige"),
+                           "kind": "Kauf" if t["betrag"] > 0 else "Verkauf",
+                           "amt": round(abs(t["betrag"]))})
+    events = [ev[d] for d in sorted(ev)]
 
     def a(r):  # analysis-Eintrag -> dict
         return None if r is None else {"name": r["name"], "total": float(r["total"]),
@@ -867,13 +894,16 @@ def main(args=None):
         "dates": dates,
         "line": {"depot": [round(v, 2) for v in pv_w.values],
                  "invested": [round(v, 2) for v in ni_w.values],
+                 "diff": [round(float(d) - float(i), 2) for d, i in zip(pv_w.values, ni_w.values)],
                  "bench": [round(v, 2) for v in bn_w.values] if bn_w is not None else None},
         "stack": {"labels": stack_labels, "series": stack_series},
+        "events": events,
         "positions": [{"name": r["name"].title(), "ticker": r["ticker"], "status": r["status"],
                        "buys": r["buys"], "returned": r["returned"], "cur_value": r["cur_value"],
                        "dividends": r["dividends"], "realized": r["realized"],
                        "unrealized": r["unrealized"], "total": r["total"],
-                       "ret_pct": r["ret_pct"], "timing": r["timing"]}
+                       "ret_pct": r["ret_pct"], "timing": r["timing"],
+                       "txns": pos_txns.get(r["name"], [])}
                       for _, r in df.sort_values("total", ascending=False).iterrows()],
         "analysis": {"best": a(best), "bestp": a(bestp), "worst": a(worst),
                      "worstp": a(worstp), "early": a(early), "smart": a(smart)},
@@ -1069,7 +1099,34 @@ _HTML_TEMPLATE = r"""<!doctype html>
   .warnbanner{margin:14px 0 2px;background:#fdeeee;border:1px solid #f3c9c9;border-radius:12px;
               padding:13px 18px;font-size:14px;color:#8a2a22}
   .panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 8px 4px;
-         box-shadow:0 1px 2px rgba(0,0,0,.03)}
+         box-shadow:0 1px 2px rgba(0,0,0,.03);position:relative}
+  #stackPieList{max-height:230px;overflow:auto;padding:2px 2px 4px}
+  .pl{display:flex;align-items:center;gap:6px;font-size:11px;padding:1px 0}
+  .pl .sw{width:9px;height:9px;border-radius:2px;flex:0 0 auto}
+  .pl .pn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pl .pv{font-variant-numeric:tabular-nums}
+  .pl .pp{color:var(--muted);width:32px;text-align:right}
+  .btnbar{display:flex;justify-content:flex-end;margin:0 0 8px}
+  .btn{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 14px;
+       font-size:13px;font-weight:600;color:var(--ink);cursor:pointer}
+  .btn:hover{background:#f0f4fb}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;margin:2px 0 6px}
+  .chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border-radius:999px;
+        border:1px solid var(--line);background:var(--card);cursor:pointer;user-select:none;white-space:nowrap}
+  .chip .sw{width:9px;height:9px;border-radius:2px;flex:0 0 auto}
+  .chip.off{opacity:.42;text-decoration:line-through}
+  .composition{display:flex;gap:16px;align-items:flex-start}
+  .sidepie{width:280px;flex:0 0 auto;padding:12px 12px 8px}
+  .sidepie-title{font-size:12.5px;color:var(--muted);font-weight:600;margin:2px 2px 6px;text-align:center}
+  .detailwrap{padding:6px 4px 10px}
+  .detailcard{background:#fafbfc;border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+  .detailcard .dh{font-size:14px;font-weight:700;margin-bottom:8px}
+  .dtbl{font-size:13px;box-shadow:none}
+  .dtbl th{background:#f1f3f6}
+  .dsum td{font-weight:700;border-top:2px solid var(--line);background:#f1f3f6}
+  td.detailcell{padding:0;background:#fafbfc}
+  #tbl tbody tr.detailrow,#tbl tbody tr.detailrow:hover{cursor:default;background:#fafbfc}
+  .posrow.open td{background:#eef2f8}
   .callouts{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:10px}
   .callout{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
   .callout h3{margin:0 0 10px;font-size:15px}
@@ -1085,6 +1142,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
   th:hover{color:var(--ink)}
   th.l,td.l{text-align:left}
   tbody tr:nth-child(even){background:#fafbfc}
+  #tbl tbody tr{cursor:pointer}
   tbody tr:hover{background:#f0f4fb}
   td.name{font-weight:600}
   .badge{font-size:11.5px;padding:2px 8px;border-radius:999px;font-weight:600}
@@ -1093,7 +1151,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
   tfoot td{font-weight:700;border-top:2px solid var(--line);background:#fafbfc}
   .right{font-variant-numeric:tabular-nums}
   footer{color:var(--muted);font-size:12px;margin-top:26px;line-height:1.6}
-  @media(max-width:760px){.cards{grid-template-columns:repeat(2,1fr)}.callouts{grid-template-columns:1fr}}
+  @media(max-width:760px){.cards{grid-template-columns:repeat(2,1fr)}.callouts{grid-template-columns:1fr}
+    .composition{flex-direction:column}.sidepie{width:100%}}
 </style>
 </head>
 <body>
@@ -1105,19 +1164,38 @@ _HTML_TEMPLATE = r"""<!doctype html>
   <div class="divbanner" id="divbanner"></div>
   <div id="cashflow"></div>
 
+  <h2>Positionen filtern</h2>
+  <p class="hint">Wirkt auf <b>alle Diagramme</b>: ausgeblendete Titel verschwinden aus dem Zusammensetzungs-Chart, und ihre Käufe/Verkäufe werden auch in den anderen Diagrammen nicht mehr markiert.</p>
+  <div class="btnbar" style="justify-content:flex-start"><button class="btn" id="stackAll">Alle</button><button class="btn" id="stackNone">Keine</button></div>
+  <div id="filterChips" class="chips"></div>
+
+  <div id="allocWrap">
+    <h2>Aktuelle Aufteilung des Depots</h2>
+    <p class="hint">Anteil jeder offenen Position am heutigen Depotwert.</p>
+    <div class="panel"><div id="allocPie" style="height:360px"></div></div>
+  </div>
+
   <h2>Entwicklung über die Zeit</h2>
-  <p class="hint">Depotwert vs. eingezahltes Geld (= „gar nicht investiert") vs. hypothetischer MSCI&nbsp;World. Mit der Maus über die Kurve fahren.</p>
+  <p class="hint">Depotwert vs. eingezahltes Geld (= „gar nicht investiert") vs. hypothetischer MSCI&nbsp;World. Beim Hovern wird zusätzlich der Gewinn/Verlust gegenüber dem eingezahlten Geld angezeigt. Dreiecke am unteren Rand markieren Käufe (grün) und Verkäufe (rot).</p>
   <div class="panel"><div id="lineChart" style="height:440px"></div></div>
 
+  <h2>Gewinn / Verlust gegenüber eingezahltem Geld (über die Zeit)</h2>
+  <p class="hint">Reiner Gewinn/Verlust im Zeitverlauf: Depotwert minus eingezahltes Geld. <span class="pos">Grün</span> = im Plus, <span class="neg">rot</span> = im Minus. Dreiecke/Linien markieren Käufe und Verkäufe.</p>
+  <div class="panel"><div id="profitChart" style="height:300px"></div></div>
+
   <h2>Woraus bestand mein Vermögen? (pro Aktie, über die Zeit)</h2>
-  <p class="hint">Gestapelter Marktwert je Position. Die Gesamthöhe entspricht dem Depotwert. Verkaufte Werte verschwinden mit dem Verkauf.</p>
-  <div class="panel"><div id="stackChart" style="height:460px"></div></div>
+  <p class="hint">Gestapelter Marktwert je Position — zu jedem Zeitpunkt sind alle damals gehaltenen Titel zu sehen. Die Torte rechts zeigt die Aufteilung zum zuletzt angefahrenen Zeitpunkt (bleibt stehen, bis man wieder hineinfährt); aufgeführt sind nur Positionen, die es damals im Depot gab. Senkrechte Linien markieren Käufe/Verkäufe.</p>
+  <div class="composition">
+    <div class="panel" style="flex:1;min-width:0"><div id="stackChart" style="height:460px"></div></div>
+    <div class="panel sidepie"><div class="sidepie-title" id="stackPieTitle"></div><div id="stackPieChart"></div><div id="stackPieList"></div></div>
+  </div>
 
   <h2>Beste Entscheidung &amp; größter Fehler</h2>
   <div class="callouts" id="callouts"></div>
 
   <h2>Ergebnis je Aktie</h2>
-  <p class="hint">Spaltenkopf anklicken zum Sortieren. „Verkauf-Timing": was die verkauften Stücke heute wert wären — <span class="pos">grün</span> = guter Ausstieg, <span class="neg">rot</span> = zu früh verkauft.</p>
+  <p class="hint">Spaltenkopf anklicken zum Sortieren, <b>eine Zeile anklicken</b> klappt die Kauf-/Verkauf-Historie direkt darunter auf. „Verkauf-Timing": was die verkauften Stücke heute wert wären — <span class="pos">grün</span> = guter Ausstieg, <span class="neg">rot</span> = zu früh verkauft.</p>
+  <div class="btnbar"><button class="btn" id="csvBtn">Als CSV herunterladen</button></div>
   <table id="tbl">
     <thead><tr>
       <th class="l" data-k="name">Aktie</th>
@@ -1138,18 +1216,18 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
 <script>
 const D = __PAYLOAD__;
-const nf0 = new Intl.NumberFormat('de-DE',{maximumFractionDigits:0});
-const e0 = x => nf0.format(Math.round(x))+' €';
-const es = x => (x>=0?'+':'−')+nf0.format(Math.abs(Math.round(x)))+' €';
-const ps = x => (x>=0?'+':'−')+nf0.format(Math.abs(Math.round(x)))+' %';
-const ps1 = x => (x>=0?'+':'−')+new Intl.NumberFormat('de-DE',{minimumFractionDigits:1,maximumFractionDigits:1}).format(Math.abs(x))+' %';
+const nf2 = new Intl.NumberFormat('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2});
+const e0 = x => nf2.format(x)+' €';                                   // max. 2 Nachkommastellen
+const es = x => (x>=0?'+':'−')+nf2.format(Math.abs(x))+' €';
+const ps = x => (x>=0?'+':'−')+nf2.format(Math.abs(x))+' %';
+const ps1 = ps;
 const cls = x => x>=0?'pos':'neg';
 
 /* ---- Stat-Karten ---- */
 document.getElementById('sub').textContent = 'Stand '+D.today+' · '+D.positions.length+' Positionen';
 if(D.incomplete && D.incomplete.length){
   document.getElementById('warnbanner').innerHTML =
-    '⚠ <b>Unvollständige Historie:</b> bei folgenden Titeln wurde mehr verkauft als gekauft – '+
+    '<b>Unvollständige Historie:</b> bei folgenden Titeln wurde mehr verkauft als gekauft – '+
     'der Kauf liegt vermutlich vor dem Export. Sie sind hier ausgeschlossen (Einstand unbekannt): <b>'+
     D.incomplete.join(', ')+'</b>. Für vollständige Zahlen den Flatex-Export ab Depoteröffnung verwenden.';
 }
@@ -1169,7 +1247,7 @@ document.getElementById('cards').innerHTML = cards.map(c=>
 const divNote = s.div_real ? 'netto, tatsächlich gutgeschrieben lt. Konto'
                            : 'brutto, geschätzt, vor Quellensteuer/KESt';
 document.getElementById('divbanner').innerHTML =
-  `💶 <span>Erhaltene <b>Dividenden: ${e0(s.dividends)}</b> (${divNote})</span>`+
+  `<span>Erhaltene <b>Dividenden: ${e0(s.dividends)}</b> (${divNote})</span>`+
   `<span style="color:var(--muted)">— Gesamtertrag inkl. Dividenden: <b class="${cls(s.total_pl+s.dividends)}">${es(s.total_pl+s.dividends)}</b></span>`;
 
 if(s.deposits!=null){
@@ -1186,33 +1264,235 @@ if(s.deposits!=null){
     `Aktueller Depotwert ${e0(s.cur_value)} bei netto ${e0(net)} eingezahltem Geld.</p>`;
 }
 
-/* ---- Verlaufschart ---- */
 const palette = ['#2c5fa8','#1a9850','#e08214','#d12c20','#7b3294','#0d8b8b','#b8860b',
-                 '#5b8a2b','#c2569a','#3b7dd8','#8c6d31','#557','#999'];
-const traces = [
-  {x:D.dates,y:D.line.invested,name:'Eingezahlt (= nicht investiert)',mode:'lines',
-   line:{color:'#2c5fa8',width:2,shape:'hv'},hovertemplate:'%{y:,.0f} €<extra>Eingezahlt</extra>'},
-  {x:D.dates,y:D.line.depot,name:'Depotwert',mode:'lines',
-   line:{color:'#111',width:2.6},hovertemplate:'%{y:,.0f} €<extra>Depotwert</extra>'}
-];
-if(D.line.bench) traces.unshift({x:D.dates,y:D.line.bench,name:'MSCI World (hypothetisch)',mode:'lines',
-   line:{color:'#9a9a9a',width:1.6,dash:'dash'},hovertemplate:'%{y:,.0f} €<extra>MSCI World</extra>'});
+                 '#5b8a2b','#c2569a','#3b7dd8','#8c6d31','#557799','#999999','#a0522d',
+                 '#2e8b8b','#9467bd','#d6604d','#4a8c2a','#cc6699','#1f6fb2','#777744',
+                 '#6a3d9a','#3aa0a0','#bdb000','#888888'];
+const stackColor = i => palette[i%palette.length];
+
+/* ---- Ereignis-Dekoration (Käufe/Verkäufe), optional auf sichtbare Titel gefiltert ---- */
+const evColorBS = (buy,sell) => (buy>0 && sell>0) ? '#9a6b13' : (buy>0 ? '#1a9850' : '#d12c20');
+function buildEvents(vis){          // vis: Set sichtbarer Stack-Labels oder null (= alle)
+  const out=[];
+  (D.events||[]).forEach(e=>{
+    const items=e.items.filter(it=>!vis||vis.has(it.label));
+    if(!items.length) return;
+    let buy=0,sell=0; items.forEach(it=>{ if(it.kind==='Kauf') buy+=it.amt; else sell+=it.amt; });
+    out.push({date:e.date,items,buy,sell});
+  });
+  return out;
+}
+function evShapes(E){
+  return E.map(e=>({type:'line',x0:e.date,x1:e.date,yref:'paper',y0:0,y1:1,
+    line:{color:evColorBS(e.buy,e.sell),width:1,dash:'dot'},opacity:0.22,layer:'below'}));
+}
+function evMarker(E){
+  const txt=E.map(e=>{
+    const head=e.date.split('-').reverse().join('.');
+    const it=e.items.slice(0,10).map(i=>i.kind+' '+i.name+' '+e0(i.amt)).join('<br>');
+    return '<b>'+head+'</b><br>'+it+(e.items.length>10?'<br>…':'');});
+  return {x:E.map(e=>e.date),y:E.map(()=>0),mode:'markers',name:'Ereignisse',showlegend:false,
+    marker:{symbol:'triangle-up',size:9,color:E.map(e=>evColorBS(e.buy,e.sell)),line:{color:'#fff',width:1}},
+    text:txt,hovertemplate:'%{text}<extra></extra>',cliponaxis:false};
+}
+const allEvents = buildEvents(null);
+
+/* ---- Globaler Filter: Sichtbarkeit der Positionen (wirkt auf ALLE Diagramme) ---- */
+const EVENT_IDX = D.stack.labels.length;        // Index der Ereignis-Marker-Spur
+const stackVis = {};
+D.stack.labels.forEach(l=>{ stackVis[l]=true; });
+function visibleSet(){ return new Set(D.stack.labels.filter(l=>stackVis[l])); }
+
 const baseLayout = {separators:',.',margin:{l:64,r:18,t:10,b:36},paper_bgcolor:'#fff',plot_bgcolor:'#fff',
   hovermode:'x unified',legend:{orientation:'h',y:1.12,x:0},
-  xaxis:{showgrid:false},yaxis:{ticksuffix:' €',tickformat:',.0f',gridcolor:'#eee',zeroline:false}};
+  xaxis:{showgrid:false,showspikes:true,spikemode:'across',spikesnap:'cursor',
+         spikethickness:1,spikecolor:'#9aa0a6',spikedash:'dot'},
+  yaxis:{ticksuffix:' €',tickformat:',.0f',gridcolor:'#eee',zeroline:false}};
 const cfg = {responsive:true,displaylogo:false,
   modeBarButtonsToRemove:['lasso2d','select2d','autoScale2d']};
-Plotly.newPlot('lineChart',traces,JSON.parse(JSON.stringify(baseLayout)),cfg);
 
-/* ---- Stacked Composition ---- */
-const st = D.stack.labels.map((lab,i)=>({
-  x:D.dates,y:D.stack.series[i],name:lab,mode:'lines',stackgroup:'one',
-  line:{width:0.5,color:palette[i%palette.length]},
-  fillcolor:palette[i%palette.length], hovertemplate:'%{y:,.0f} €<extra>'+lab+'</extra>'}));
+/* ---- Verlaufschart (Depot vs. eingezahlt vs. MSCI World) ---- */
+function drawLine(){
+  const E=buildEvents(visibleSet());
+  const tr=[
+    {x:D.dates,y:D.line.invested,name:'Eingezahlt (= nicht investiert)',mode:'lines',
+     line:{color:'#2c5fa8',width:2,shape:'hv'},hovertemplate:'%{y:,.2f} €<extra>Eingezahlt</extra>'},
+    {x:D.dates,y:D.line.depot,name:'Depotwert',mode:'lines',customdata:D.line.diff,
+     line:{color:'#111',width:2.6},
+     hovertemplate:'%{y:,.2f} €  (G/V %{customdata:+,.2f} €)<extra>Depotwert</extra>'}
+  ];
+  if(D.line.bench) tr.unshift({x:D.dates,y:D.line.bench,name:'MSCI World (hypothetisch)',mode:'lines',
+     line:{color:'#9a9a9a',width:1.6,dash:'dash'},hovertemplate:'%{y:,.2f} €<extra>MSCI World</extra>'});
+  tr.push(evMarker(E));
+  const lay=JSON.parse(JSON.stringify(baseLayout));
+  lay.shapes=evShapes(E);
+  Plotly.react('lineChart',tr,lay,cfg);
+}
+
+/* ---- Gewinn/Verlust-Kurve gegenüber eingezahltem Geld (wie im PNG) ---- */
+function drawProfit(){
+  const E=buildEvents(visibleSet());
+  const diff=D.line.diff;
+  const pos=diff.map(v=>v>0?v:0), neg=diff.map(v=>v<0?v:0);
+  const pt=[
+    {x:D.dates,y:pos,mode:'lines',fill:'tozeroy',fillcolor:'rgba(26,152,80,.28)',
+     line:{width:0},hoverinfo:'skip',showlegend:false},
+    {x:D.dates,y:neg,mode:'lines',fill:'tozeroy',fillcolor:'rgba(209,44,32,.28)',
+     line:{width:0},hoverinfo:'skip',showlegend:false},
+    {x:D.dates,y:diff,mode:'lines',name:'Gewinn/Verlust',line:{color:'#111',width:2},
+     hovertemplate:'%{y:+,.2f} €<extra>Gewinn/Verlust</extra>'}
+  ];
+  if(D.line.bench){
+    const bp=D.line.bench.map((b,i)=>b-D.line.invested[i]);
+    pt.push({x:D.dates,y:bp,mode:'lines',name:'MSCI World (G/V)',
+      line:{color:'#9a9a9a',width:1.4,dash:'dash'},
+      hovertemplate:'%{y:+,.2f} €<extra>MSCI World</extra>'});
+  }
+  pt.push(evMarker(E));
+  const lay=JSON.parse(JSON.stringify(baseLayout));
+  lay.yaxis.zeroline=true; lay.yaxis.zerolinecolor='#555'; lay.yaxis.zerolinewidth=1;
+  lay.legend={orientation:'h',y:1.14,x:0};
+  lay.shapes=evShapes(E);
+  Plotly.react('profitChart',pt,lay,cfg);
+}
+
+/* ---- Aktuelle Aufteilung (Pie in der Übersicht) ---- */
+(function(){
+  const cur=D.positions.filter(r=>r.cur_value>0.5).sort((a,b)=>b.cur_value-a.cur_value);
+  if(!cur.length){const w=document.getElementById('allocWrap'); if(w) w.style.display='none'; return;}
+  Plotly.newPlot('allocPie',[{type:'pie',labels:cur.map(r=>r.name),values:cur.map(r=>r.cur_value),
+    marker:{colors:cur.map((_,i)=>stackColor(i)),line:{color:'#fff',width:1}},
+    texttemplate:'%{label} %{percent:.1%}',textposition:'inside',insidetextorientation:'radial',
+    hovertemplate:'%{label}<br>%{value:,.2f} € (%{percent:.1%})<extra></extra>',hole:0.5,
+    sort:true,direction:'clockwise',rotation:0}],
+    {separators:',.',margin:{l:10,r:10,t:10,b:10},height:360,paper_bgcolor:'#fff',
+     showlegend:true,legend:{orientation:'v',x:1.02,y:0.5,font:{size:11}},
+     annotations:[{text:e0(D.stats.cur_value),showarrow:false,font:{size:15}}]},
+    {displaylogo:false,responsive:true,displayModeBar:false});
+})();
+
+/* ---- Stacked Composition (alle jemals gehaltenen Positionen) ----
+   Sichtbarkeit zentral über stackVis; Chart bei jeder Änderung komplett neu aufgebaut
+   (Plotly.react) — vermeidet den Render-Fehler (weiße Flächen) beim Wiedereinblenden
+   und das Timing-Problem der Ereignis-Marker. y=null außerhalb der Haltedauer;
+   hoverinfo:'none' unterdrückt den nativen Tooltip (sonst tauchten 0-€-Titel auf). */
 const stackLayout = JSON.parse(JSON.stringify(baseLayout));
 stackLayout.legend={orientation:'h',y:-0.16,x:0,font:{size:11}};
 stackLayout.margin.b=70;
-Plotly.newPlot('stackChart',st,stackLayout,cfg);
+const stackEl=document.getElementById('stackChart');
+function drawStack(){
+  const tr=D.stack.labels.map((lab,i)=>({
+    x:D.dates,y:D.stack.series[i].map(v=>v>0?v:null),name:lab,mode:'lines',stackgroup:'one',
+    line:{width:0.5,color:stackColor(i)},fillcolor:stackColor(i),hoverinfo:'none',
+    visible: stackVis[lab] ? true : 'legendonly'}));
+  const E=buildEvents(visibleSet());
+  tr.push(evMarker(E));
+  const lay=JSON.parse(JSON.stringify(stackLayout));
+  lay.shapes=evShapes(E);
+  Plotly.react('stackChart',tr,lay,cfg);
+}
+
+/* ---- Seitliche Torte: bleibt stehen (letzter angefahrener Zeitpunkt) ---- */
+const pieChartDiv=document.getElementById('stackPieChart');
+const pieListDiv=document.getElementById('stackPieList');
+const pieTitle=document.getElementById('stackPieTitle');
+let lastPieIdx=D.dates.length-1;
+function showPie(idx){
+  if(idx==null) idx=D.dates.length-1;
+  lastPieIdx=idx;
+  const dstr=D.dates[idx].split('-').reverse().join('.');
+  let items=[];
+  D.stack.labels.forEach((lab,i)=>{ if(!stackVis[lab]) return;
+    const v=D.stack.series[i][idx]; if(v>0) items.push({lab,v,c:stackColor(i)}); });
+  if(!items.length){
+    pieTitle.textContent=dstr+' · keine sichtbare Position';
+    Plotly.react(pieChartDiv,[],{margin:{t:0,b:0,l:0,r:0},height:210,width:256,paper_bgcolor:'#fff'},
+      {displayModeBar:false,responsive:false});
+    pieListDiv.innerHTML=''; return;
+  }
+  items.sort((a,b)=>b.v-a.v);
+  const tot=items.reduce((s,x)=>s+x.v,0);
+  pieTitle.textContent=dstr+' · '+e0(tot);
+  Plotly.react(pieChartDiv,[{type:'pie',labels:items.map(x=>x.lab),values:items.map(x=>x.v),
+    marker:{colors:items.map(x=>x.c),line:{color:'#fff',width:1}},
+    texttemplate:'%{percent:.1%}',hovertemplate:'%{label}<br>%{value:,.2f} € (%{percent:.1%})<extra></extra>',
+    sort:true,direction:'clockwise',rotation:0,hole:0.45}],
+    {separators:',.',margin:{l:6,r:6,t:6,b:6},height:210,width:256,paper_bgcolor:'#fff',showlegend:false},
+    {displayModeBar:false,responsive:false});
+  pieListDiv.innerHTML=items.map(x=>
+    `<div class="pl"><span class="sw" style="background:${x.c}"></span>`+
+    `<span class="pn">${x.lab}</span><span class="pv">${e0(x.v)}</span>`+
+    `<span class="pp">${(x.v/tot*100).toFixed(1)}%</span></div>`).join('');
+}
+
+/* ---- Zentrale Filter-Chips ---- */
+function renderChips(){
+  document.getElementById('filterChips').innerHTML=D.stack.labels.map((l,i)=>
+    `<span class="chip ${stackVis[l]?'':'off'}" data-l="${encodeURIComponent(l)}">`+
+    `<span class="sw" style="background:${stackColor(i)}"></span>${l}</span>`).join('');
+}
+function applyFilter(){ zooming=true; drawLine(); drawProfit(); drawStack(); renderChips(); showPie(lastPieIdx); zooming=false; }
+
+/* ---- Erst-Rendering: legt die Plotly-Graphen an, BEVOR Events gebunden werden ---- */
+drawLine(); drawProfit(); drawStack(); renderChips(); showPie(lastPieIdx);
+
+/* ---- Events binden (Graph-Divs existieren jetzt) ---- */
+document.getElementById('filterChips').addEventListener('click',e=>{
+  const c=e.target.closest('.chip'); if(!c) return;
+  const l=decodeURIComponent(c.dataset.l); stackVis[l]=!stackVis[l]; applyFilter();
+});
+document.getElementById('stackAll').addEventListener('click',
+  ()=>{ D.stack.labels.forEach(l=>{stackVis[l]=true;}); applyFilter(); });
+document.getElementById('stackNone').addEventListener('click',
+  ()=>{ D.stack.labels.forEach(l=>{stackVis[l]=false;}); applyFilter(); });
+stackEl.on('plotly_legendclick',d=>{
+  if(d.curveNumber<EVENT_IDX){ const l=D.stack.labels[d.curveNumber]; stackVis[l]=!stackVis[l]; applyFilter(); }
+  return false;
+});
+stackEl.on('plotly_legenddoubleclick',d=>{
+  if(d.curveNumber<EVENT_IDX){
+    const l=D.stack.labels[d.curveNumber];
+    const onlyThis=D.stack.labels.every(x=> (x===l)===!!stackVis[x]);
+    D.stack.labels.forEach(x=>{ stackVis[x]= onlyThis ? true : (x===l); });
+    applyFilter();
+  }
+  return false;
+});
+stackEl.on('plotly_hover',ev=>{ const p=ev.points.find(pt=>pt.data.stackgroup==='one'); if(p) showPie(p.pointIndex); });
+
+/* ---- Hover + Pan/Zoom über alle Zeit-Diagramme synchronisieren ----
+   Hover wird per Index synchronisiert: xval muss in Achseneinheiten (ms) angegeben
+   werden, ein Datums-String funktioniert bei einer Datumsachse nicht. */
+const SYNC=['lineChart','profitChart','stackChart'];
+const xnum=D.dates.map(d=>new Date(d).getTime());
+let syncing=false, zooming=false;
+SYNC.forEach(id=>{
+  const gd=document.getElementById(id);
+  gd.on('plotly_hover',e=>{
+    if(syncing||!e.points||!e.points.length) return;
+    const p=e.points.find(pt=>pt.data.name!=='Ereignisse' && pt.pointIndex!=null)||e.points[0];
+    const idx=(p.pointIndex!=null)?p.pointIndex:p.pointNumber;
+    if(idx==null||xnum[idx]==null) return;
+    syncing=true;
+    SYNC.forEach(o=>{ if(o!==id){ try{Plotly.Fx.hover(o,{xval:xnum[idx]});}catch(_){} } });
+    syncing=false;
+  });
+  gd.on('plotly_unhover',()=>{
+    if(syncing) return; syncing=true;
+    SYNC.forEach(o=>{ if(o!==id){ try{Plotly.Fx.unhover(o);}catch(_){} } });
+    syncing=false;
+  });
+  gd.on('plotly_relayout',ev=>{
+    if(zooming) return;
+    let upd=null;
+    if(ev['xaxis.range[0]']!==undefined) upd={'xaxis.range':[ev['xaxis.range[0]'],ev['xaxis.range[1]']]};
+    else if(ev['xaxis.autorange']) upd={'xaxis.autorange':true};
+    if(!upd) return;
+    zooming=true;
+    SYNC.forEach(o=>{ if(o!==id){ try{Plotly.relayout(o,upd);}catch(_){} } });
+    zooming=false;
+  });
+});
 
 /* ---- Callouts ---- */
 const A = D.analysis;
@@ -1225,34 +1505,66 @@ if(A.worst)  worst += row('Größter Verlust', A.worst.name+' &nbsp;'+es(A.worst
 if(A.worstp && A.worstp.name!==A.worst.name) worst += row('Schlechteste Rendite', A.worstp.name+' &nbsp;'+ps(A.worstp.ret_pct),'neg');
 if(A.early && A.early.timing>20) worst += row('Zu früh verkauft', A.early.name+' &nbsp;'+es(-A.early.timing)+' entgangen','neg');
 document.getElementById('callouts').innerHTML =
-  `<div class="callout"><h3>🏆 Beste Entscheidung</h3>${best}</div>`+
-  `<div class="callout"><h3>❌ Größter Fehler</h3>${worst}</div>`;
+  `<div class="callout"><h3>Beste Entscheidung</h3>${best}</div>`+
+  `<div class="callout"><h3>Größter Fehler</h3>${worst}</div>`;
 
 /* ---- Tabelle ---- */
-const badge = s=>({'offen':'<span class="badge b-open">● offen</span>',
-  'teilw. verkauft':'<span class="badge b-part">◐ teilweise</span>',
-  'verkauft':'<span class="badge b-sold">✓ verkauft</span>'}[s]);
+const badge = s=>({'offen':'<span class="badge b-open">offen</span>',
+  'teilw. verkauft':'<span class="badge b-part">teilweise</span>',
+  'verkauft':'<span class="badge b-sold">verkauft</span>'}[s]);
 function timingCell(t){
   if(Math.abs(t)<1) return '<span style="color:#aaa">–</span>';
   const impact = -t; // sold-too-early -> negativ (rot), guter Ausstieg -> positiv (grün)
   return `<span class="${cls(impact)}">${es(impact)}</span>`;
 }
 let sortK='total', sortDir=-1;
+const expanded=new Set();
+/* Inline aufklappbare Kauf-/Verkauf-Historie je Position */
+function detailHtml(r){
+  if(!r.txns||!r.txns.length)
+    return '<div class="detailwrap"><div class="detailcard">Keine Transaktionen erfasst.</div></div>';
+  let net=0,buy=0,sell=0;
+  const body=r.txns.map(t=>{
+    net+=t.a; const cf=-t.a;            // Verkauf = +Geld rein, Kauf = −Geld raus
+    if(t.a>0) buy+=t.a; else sell+=-t.a;
+    return `<tr>
+      <td class="l">${t.d}</td><td class="l">${t.k}</td>
+      <td class="right">${nf2.format(t.q)}</td>
+      <td class="right">${t.p?nf2.format(t.p):'–'}</td>
+      <td class="right ${cf>=0?'pos':'neg'}">${es(cf)}</td>
+      <td class="right">${e0(net)}</td></tr>`;}).join('');
+  return `<div class="detailwrap"><div class="detailcard">
+    <div class="dh">${r.name} – Kauf-/Verkauf-Historie</div>
+    <table class="dtbl"><thead><tr>
+      <th class="l">Datum</th><th class="l">Aktion</th><th>Stück</th><th>Kurs</th>
+      <th>Cashflow</th><th>Netto investiert</th></tr></thead>
+    <tbody>${body}</tbody>
+    <tfoot><tr class="dsum"><td class="l">Summe</td><td></td><td></td><td></td>
+      <td class="right">gekauft ${e0(buy)} · verkauft ${e0(sell)}</td>
+      <td class="right">${e0(net)}</td></tr></tfoot></table>
+    <p class="hint" style="margin:8px 2px 0">„Cashflow": <span class="pos">+</span> = Geld erhalten (Verkauf), <span class="neg">−</span> = Geld eingesetzt (Kauf). „Netto investiert" = bis dahin per Saldo investiertes Geld. Kurs in Handelswährung.</p>
+  </div></div>`;
+}
 function draw(){
   const rows=[...D.positions].sort((a,b)=>{
     let x=a[sortK],y=b[sortK];
     if(typeof x==='string') return sortDir*x.localeCompare(y);
     return sortDir*(x-y);
   });
-  document.querySelector('#tbl tbody').innerHTML = rows.map(r=>`<tr>
-    <td class="l name">${r.name}</td>
-    <td class="l">${badge(r.status)}</td>
-    <td class="right">${e0(r.buys)}</td>
-    <td class="right">${e0(r.returned)}</td>
-    <td class="right">${r.dividends>0.5?'<span class="pos">'+e0(r.dividends)+'</span>':'<span style="color:#bbb">–</span>'}</td>
-    <td class="right ${cls(r.total)}">${es(r.total)}</td>
-    <td class="right ${cls(r.ret_pct)}">${ps(r.ret_pct)}</td>
-    <td class="right">${timingCell(r.timing)}</td></tr>`).join('');
+  document.querySelector('#tbl tbody').innerHTML = rows.map(r=>{
+    const open=expanded.has(r.name);
+    let html=`<tr class="posrow${open?' open':''}" data-name="${r.name}">
+      <td class="l name">${open?'▾ ':'▸ '}${r.name}</td>
+      <td class="l">${badge(r.status)}</td>
+      <td class="right">${e0(r.buys)}</td>
+      <td class="right">${e0(r.returned)}</td>
+      <td class="right">${r.dividends>0.5?'<span class="pos">'+e0(r.dividends)+'</span>':'<span style="color:#bbb">–</span>'}</td>
+      <td class="right ${cls(r.total)}">${es(r.total)}</td>
+      <td class="right ${cls(r.ret_pct)}">${ps(r.ret_pct)}</td>
+      <td class="right">${timingCell(r.timing)}</td></tr>`;
+    if(open) html+=`<tr class="detailrow"><td class="detailcell" colspan="8">${detailHtml(r)}</td></tr>`;
+    return html;
+  }).join('');
   const T=(k)=>D.positions.reduce((a,r)=>a+r[k],0);
   document.querySelector('#tbl tfoot').innerHTML=`<tr>
     <td class="l">GESAMT</td><td></td>
@@ -1266,7 +1578,32 @@ function draw(){
 document.querySelectorAll('#tbl th').forEach(th=>th.addEventListener('click',()=>{
   const k=th.dataset.k; sortDir = (sortK===k)? -sortDir : (k==='name'?1:-1); sortK=k; draw();
 }));
+document.querySelector('#tbl tbody').addEventListener('click',e=>{
+  const tr=e.target.closest('tr.posrow'); if(!tr) return;
+  const n=tr.dataset.name; if(expanded.has(n)) expanded.delete(n); else expanded.add(n);
+  draw();
+});
 draw();
+
+/* ---- Tabelle als CSV exportieren (in aktueller Sortierung) ---- */
+function sortedRows(){
+  return [...D.positions].sort((a,b)=>{
+    let x=a[sortK],y=b[sortK];
+    if(typeof x==='string') return sortDir*x.localeCompare(y);
+    return sortDir*(x-y);
+  });
+}
+function num(v){ return (typeof v==='number') ? v.toFixed(2).replace('.',',') : String(v); }
+document.getElementById('csvBtn').addEventListener('click',()=>{
+  const cols=['name','status','buys','returned','cur_value','dividends','realized','unrealized','total','ret_pct','timing'];
+  const head=['Aktie','Status','Eingezahlt','Erlös+Wert heute','Wert heute','Dividende','Realisiert','Unrealisiert','Gewinn/Verlust','Rendite %','Verkauf-Timing'];
+  const q=s=>'"'+String(s).replace(/"/g,'""')+'"';
+  let csv='﻿'+head.map(q).join(';')+'\r\n';
+  sortedRows().forEach(r=>{ csv+=cols.map(k=>q(num(r[k]))).join(';')+'\r\n'; });
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+  a.download='positionen.csv'; document.body.appendChild(a); a.click(); a.remove();
+});
 
 document.getElementById('foot').innerHTML =
   'Realisierte G/V exakt aus den Cashflows · Marktwerte über Yahoo-Kurse, in EUR umgerechnet über tägliche Devisenkurse · '+

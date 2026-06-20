@@ -3,11 +3,13 @@
 
 # Generierte Reports / Grafiken
 portfolio_report.html
+bitpanda_report.html
 *.png
 
 # Cache (Kurse, Splits, Devisen, ISIN->Ticker-Auflösung)
 cache/
 tickers.json
+crypto_tickers.json
 
 # Lokale Sonderbewertungen (kann persönliche Bestände enthalten)
 overrides.json
