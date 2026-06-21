@@ -1,6 +1,6 @@
 services:
   portfolio:
-    build: .
+    image: ghcr.io/xtncl/flatex-portfolio-analyse:latest
     ports:
       - "8080:8080"
     volumes:
