@@ -821,9 +821,16 @@ def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None,
 
     _log("XIRR & Benchmark berechnen …")
     flow = pd.Series(0.0, index=bdays)
+    flow_cost = pd.Series(0.0, index=bdays)   # für Chart: Kostenbasis statt Erlös beim Verkauf
     for t in cash_txns:
-        flow.loc[pd.Timestamp(t["date"]):] += t["betrag"]
-    net_invested = flow
+        d = pd.Timestamp(t["date"])
+        flow.loc[d:] += t["betrag"]
+        if t["betrag"] > 0:                   # Kauf: voller Betrag
+            flow_cost.loc[d:] += t["betrag"]
+        else:                                  # Verkauf: nur FIFO-Kostenbasis abziehen
+            flow_cost.loc[d:] -= t.get("_cost", 0.0)
+    net_invested    = flow                     # bleibt für XIRR / G/V-Diff korrekt
+    invested_capital = flow_cost.clip(lower=0) # Chart: nie negativ, geht auf 0 wenn alles verkauft
 
     bench_pe = price_eur_series(BENCH_TICKER, bdays)
     bench_value = None
@@ -847,12 +854,15 @@ def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None,
         units = pd.Series(0.0, index=bdays)
         for t in ins["txns"]:
             d = pd.Timestamp(t["date"])
-            inv.loc[d:] += t["betrag"]
+            if t["betrag"] > 0:
+                inv.loc[d:] += t["betrag"]
+            else:
+                inv.loc[d:] -= t.get("_cost", 0.0)
             if bench_pe is not None:
                 p = bench_pe.loc[d] if d in bench_pe.index else bench_pe.reindex([d]).ffill().iloc[0]
                 if p and p > 0:
                     units.loc[d:] += t["betrag"] / p
-        inst_invested[ins["name"]] = inv
+        inst_invested[ins["name"]] = inv.clip(lower=0)
         if bench_pe is not None:
             inst_bench[ins["name"]] = units * bench_pe
 
@@ -889,7 +899,8 @@ def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None,
 
     inst_df = pd.DataFrame(inst_values).reindex(bdays).fillna(0.0)
     pv_w  = portfolio_value
-    ni_w  = net_invested
+    ni_w  = net_invested       # Netto-Cashflow (für G/V-Diff korrekt, kann negativ sein)
+    ic_w  = invested_capital   # Kostenbasis-Reihe (Chart-Anzeige, nie negativ)
     bn_w  = bench_value
     dates = [d.strftime("%Y-%m-%d") for d in bdays]
 
@@ -1043,6 +1054,7 @@ def compute_payload(tx_path, cash_path=None, cache_dir=None, today=None,
         "dates": dates,
         "line": {"depot": [round(v, 2) for v in pv_w.values],
                  "invested": [round(v, 2) for v in ni_w.values],
+                 "invested_cost": [round(v, 2) for v in ic_w.values],
                  "diff": [round(float(d) - float(i), 2) for d, i in zip(pv_w.values, ni_w.values)],
                  "bench": [round(v, 2) for v in bn_w.values] if bn_w is not None else None,
                  "bench2": [round(v, 2) for v in bn2_w.values] if bn2_w is not None else None,
@@ -2248,8 +2260,10 @@ function sumVisible(arr){
    Benchmark wechselt je nach window._selBench (msci / sp500 / none). */
 function filteredLines(){
   const all=allVisible() || !D.stack.invested;
-  const depot   = all?D.line.depot   :sumVisible(D.stack.series);
-  const invested= all?D.line.invested:sumVisible(D.stack.invested);
+  const depot        = all?D.line.depot   :sumVisible(D.stack.series);
+  const invested     = all?D.line.invested:sumVisible(D.stack.invested); // netto (für G/V-Diff)
+  const invested_cost= all?(D.line.invested_cost||D.line.invested)      // Kostenbasis (für Chart-Linie)
+                          :sumVisible(D.stack.invested);
   const diff    = depot.map((v,i)=>v-invested[i]);
   const bk=window._selBench;
   let bench=null;
@@ -2257,7 +2271,7 @@ function filteredLines(){
     bench = all ? D.line.bench : (D.stack.bench ? sumVisible(D.stack.bench) : D.line.bench);
   else if(bk==='sp500' && D.line.bench2)
     bench = all ? D.line.bench2 : (D.stack.bench2 ? sumVisible(D.stack.bench2) : D.line.bench2);
-  return {depot,invested,diff,bench};
+  return {depot,invested,invested_cost,diff,bench};
 }
 function benchLabel(){ return window._selBench==='sp500'?'S&P 500 (hypothetisch)':'MSCI World (hypothetisch)'; }
 
@@ -2278,8 +2292,8 @@ function drawLine(){
   const F=filteredLines();
   const E=buildEvents(visibleSet());
   const tr=[
-    {x:D.dates,y:F.invested,name:'Eingezahlt (= nicht investiert)',mode:'lines',
-     line:{color:'#2c5fa8',width:1.8,shape:'hv'},hovertemplate:'%{y:,.2f} €<extra>Eingezahlt</extra>'},
+    {x:D.dates,y:F.invested_cost,name:'Eingezahltes Kapital (Kostenbasis)',mode:'lines',
+     line:{color:'#2c5fa8',width:1.8,shape:'hv'},hovertemplate:'%{y:,.2f} €<extra>Eingezahltes Kapital</extra>'},
     {x:D.dates,y:F.depot,name:'Depotwert',mode:'lines',customdata:F.diff,
      line:{color:'#111',width:2.5},
      hovertemplate:'%{y:,.2f} €  (G/V %{customdata:+,.2f} €)<extra>Depotwert</extra>'}
